@@ -4,7 +4,9 @@
 
 It creates a clean workspace for a new HTB machine, generates target configuration, helper scripts, starter notes, a writeup template, a Linux privilege escalation checklist, automated recon tooling, and a ZIP archive helper.
 
-The generated workflow is intended for authorized Hack The Box labs only.
+The repository also includes `analyze-recon.py`, a standalone offline analysis helper that reviews collected recon output and generates prioritized next-step suggestions.
+
+The workflow is intended for authorized Hack The Box labs only.
 
 ---
 
@@ -18,10 +20,17 @@ The generated workflow is intended for authorized Hack The Box labs only.
 - Generates starter `notes.md` and `writeup.md`
 - Generates a Linux privilege escalation checklist
 - Runs service-aware enumeration based on discovered ports
-- Probes every open TCP port for HTTP and HTTPS
+- Performs TCP and UDP discovery
+- Performs web discovery with `httpx` when ProjectDiscovery `httpx` is available
+- Falls back to curl-based HTTP/HTTPS probing when ProjectDiscovery `httpx` is not available
+- Uses faster timeout-safe curl probing for Windows/AD-style targets
+- Avoids wasting time on obvious non-web AD ports during web probing
+- Runs service-specific enumeration for DNS, SMB, FTP, SSH, NFS/RPC, SNMP, LDAP, Kerberos, and WinRM
+- Wraps noisy/hanging SMB tools such as `enum4linux` with a timeout
 - Saves console output and recon summaries
 - Automatically creates a ZIP archive after recon
 - Avoids overwriting existing `notes.md` and `writeup.md`
+- Provides optional offline recon interpretation through `analyze-recon.py`
 
 ---
 
@@ -30,7 +39,8 @@ The generated workflow is intended for authorized Hack The Box labs only.
 ```text
 htb-init/
 ├── README.md
-└── htb-init.sh
+├── htb-init.sh
+└── analyze-recon.py
 ```
 
 ---
@@ -44,16 +54,26 @@ git clone https://github.com/Zendeni/htb-init.git
 cd htb-init
 ```
 
-Make the script executable:
+Make the scripts executable:
 
 ```bash
 chmod +x htb-init.sh
+chmod +x analyze-recon.py
 ```
 
-Install it as `htb-init`:
+Install `htb-init` as a system command:
 
 ```bash
 sudo cp htb-init.sh /usr/local/bin/htb-init
+sudo chmod +x /usr/local/bin/htb-init
+```
+
+Optional: install `analyze-recon.py` into your HTB tools folder:
+
+```bash
+mkdir -p /home/zendeni/tools/htb
+cp analyze-recon.py /home/zendeni/tools/htb/analyze-recon.py
+chmod +x /home/zendeni/tools/htb/analyze-recon.py
 ```
 
 Confirm installation:
@@ -61,6 +81,7 @@ Confirm installation:
 ```bash
 which htb-init
 head -n 1 "$(which htb-init)"
+bash -n "$(which htb-init)" && echo "syntax OK"
 ```
 
 Expected:
@@ -68,6 +89,7 @@ Expected:
 ```text
 /usr/local/bin/htb-init
 #!/usr/bin/env bash
+syntax OK
 ```
 
 ---
@@ -127,6 +149,7 @@ sudo
 awk
 getent
 nmap
+timeout
 zip
 ```
 
@@ -165,7 +188,12 @@ netexec
 crackmapexec
 ```
 
-If `httpx` is missing, the generated `recon.sh` falls back to curl-based HTTP/HTTPS probing.
+Notes:
+
+- If ProjectDiscovery `httpx` is available, `recon.sh` uses it for HTTP/HTTPS probing.
+- If another tool named `httpx` is installed, `recon.sh` detects this and falls back to curl.
+- If `httpx` is missing entirely, `recon.sh` also falls back to curl.
+- `enum4linux` and `enum4linux-ng` are useful but can be noisy or slow on Windows/AD targets, so they are timeout-wrapped.
 
 ---
 
@@ -208,6 +236,12 @@ After `recon.sh` runs, it also creates:
 summary.md
 recon-console.log
 <box>-recon-<timestamp>.zip
+```
+
+If `analyze-recon.py` is run against the workspace, it creates:
+
+```text
+recon-analysis.md
 ```
 
 ---
@@ -265,9 +299,10 @@ It performs:
 - Tool availability check
 - Full TCP port scan
 - TCP service/version enumeration
+- TCP aggressive scan
 - TCP default/safe Nmap scripts
 - UDP top ports scan
-- HTTP/HTTPS discovery across all open TCP ports
+- HTTP/HTTPS discovery
 - Web enumeration with whatweb, curl, feroxbuster, ffuf, nikto
 - Host-header web checks
 - JavaScript extraction and keyword grep
@@ -277,7 +312,9 @@ It performs:
 - SSH enumeration if port 22 is open
 - NFS/RPC enumeration if relevant ports are open
 - SNMP enumeration if UDP/161 is found
-- LDAP/Kerberos/WinRM enumeration if relevant ports are open
+- LDAP enumeration if LDAP ports are open
+- Kerberos enumeration if port 88 is open
+- WinRM enumeration if ports 5985/5986 are open
 - Optional Nmap vulnerability script scan
 - Interesting keyword grep
 - Recon summary generation
@@ -292,10 +329,12 @@ recon-console.log
 scans/tcp-full.txt
 scans/tcp-services.txt
 scans/tcp-aggressive.txt
+scans/tcp-default-safe-scripts.txt
 scans/tcp-vuln.txt
 scans/udp-top100.txt
 scans/port-summary.md
 enum/web/live-web-urls.txt
+enum/web/curl-web-probe.txt
 enum/interesting-grep.txt
 ```
 
@@ -401,24 +440,160 @@ Linux privilege escalation checklist covering:
 
 ---
 
+## Optional: `analyze-recon.py`
+
+`analyze-recon.py` is a standalone offline recon analysis helper.
+
+It does **not** run exploitation. It does **not** modify the target. It reads collected recon output and generates a prioritized analysis report.
+
+It supports:
+
+```text
+- Extracted HTB workspace folders
+- ZIP archives generated by zip-recon.sh
+```
+
+Example against a workspace folder:
+
+```bash
+python3 analyze-recon.py /home/zendeni/htb_labs/principal
+```
+
+Example against a recon ZIP:
+
+```bash
+python3 analyze-recon.py /home/zendeni/htb_labs/principal/principal-recon-20260524-135821.zip
+```
+
+It generates:
+
+```text
+recon-analysis.md
+```
+
+Depending on the available data, it attempts to extract and summarize:
+
+```text
+- Target metadata
+- Open ports
+- Detected services
+- Detected technologies
+- Likely machine profile
+- Web URLs
+- Web headers
+- Forms and input fields
+- JavaScript references
+- API endpoints
+- Authentication-related clues
+- SMB shares
+- LDAP naming contexts
+- AD/DC indicators
+- MSSQL indicators
+- WinRM indicators
+- High-value next steps
+- CVE/research search suggestions
+- Interesting grep highlights
+```
+
+Example output sections:
+
+```text
+Detected Profile
+Open Ports
+Detected Technologies
+Web Intelligence
+AD / SMB / LDAP Intelligence
+Prioritized Findings and Next Steps
+CVE / Research Search Suggestions
+Interesting Grep Highlights
+Files Parsed
+```
+
+Treat all suggestions from `analyze-recon.py` as hypotheses requiring manual validation.
+
+---
+
 ## Recommended Workflow
+
+### 1. Initialize the box
 
 ```bash
 htb-init principal 10.129.244.220
+```
+
+### 2. Enter the workspace
+
+```bash
 cd /home/zendeni/htb_labs/principal
+```
+
+### 3. Update `/etc/hosts`
+
+```bash
 ./update-hosts.sh
+```
+
+### 4. Run recon
+
+```bash
 ./recon.sh
+```
+
+### 5. Review the raw recon summary
+
+```bash
 less summary.md
 ```
 
-Useful review commands:
+### 6. Optionally run recon analysis
+
+From the repository folder:
+
+```bash
+python3 /home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal
+```
+
+Or, if `analyze-recon.py` is in the current repository folder:
+
+```bash
+python3 analyze-recon.py /home/zendeni/htb_labs/principal
+```
+
+Then review:
+
+```bash
+less /home/zendeni/htb_labs/principal/recon-analysis.md
+```
+
+---
+
+## Useful Review Commands
 
 ```bash
 cat scans/open-tcp-ports.txt
 cat scans/port-summary.md
 cat enum/web/live-web-urls.txt
+cat enum/web/curl-web-probe.txt
 cat enum/interesting-grep.txt
 less summary.md
+```
+
+For Windows/AD-style boxes:
+
+```bash
+cat enum/smb/smbclient-null.txt 2>/dev/null
+cat enum/smb/netexec-smb.txt 2>/dev/null
+cat enum/ldap/namingcontexts.txt 2>/dev/null
+cat enum/winrm/netexec-winrm.txt 2>/dev/null
+cat scans/port-summary.md
+```
+
+For web-heavy boxes:
+
+```bash
+cat enum/web/live-web-urls.txt
+grep -RniE "fetch|axios|/api/|token|auth|login|admin|dashboard|password|secret" enum/web/
+find enum/web -type f -size +0c | sort
 ```
 
 ---
@@ -442,6 +617,8 @@ writeup.md
 ```
 
 This prevents accidental loss of manual notes or report work when rerunning `htb-init`.
+
+The recon workflow is intended for authorized lab targets only.
 
 ---
 
@@ -474,10 +651,19 @@ and a generated archive like:
 bounty-recon-20260524-153000.zip
 ```
 
+Optional analysis:
+
+```bash
+python3 /home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/bounty
+less /home/zendeni/htb_labs/bounty/recon-analysis.md
+```
+
 ---
 
 ## Notes
 
 This tool is designed for personal HTB methodology, repeatability, and clean writeup preparation.
 
-It does not perform exploitation. It only creates a workspace and runs first-stage enumeration against machines you are authorized to test.
+It does not perform exploitation. It creates a workspace, runs first-stage enumeration, packages recon data, and optionally analyzes collected recon artifacts for likely next steps.
+
+Keep `htb-init.sh` stable. Develop and improve `analyze-recon.py` separately so recon collection remains reliable.
