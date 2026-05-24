@@ -4,7 +4,71 @@
 
 It creates a clean workspace for a new HTB machine, generates target configuration, helper scripts, starter notes, a writeup template, a Linux privilege escalation checklist, automated recon tooling, and a ZIP archive helper.
 
-The generated workflow is intended for authorized HTB labs only.
+The generated workflow is intended for authorized Hack The Box labs only.
+
+---
+
+## Features
+
+- Creates a structured workspace under `/home/zendeni/htb_labs/<box>/`
+- Generates a machine-local `.target.env`
+- Generates an `/etc/hosts` update helper
+- Generates an automated `recon.sh` script
+- Generates a recon ZIP archive helper
+- Generates starter `notes.md` and `writeup.md`
+- Generates a Linux privilege escalation checklist
+- Runs service-aware enumeration based on discovered ports
+- Probes every open TCP port for HTTP and HTTPS
+- Saves console output and recon summaries
+- Automatically creates a ZIP archive after recon
+- Avoids overwriting existing `notes.md` and `writeup.md`
+
+---
+
+## Repository Structure
+
+```text
+htb-init/
+├── README.md
+└── htb-init.sh
+```
+
+---
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Zendeni/htb-init.git
+cd htb-init
+```
+
+Make the script executable:
+
+```bash
+chmod +x htb-init.sh
+```
+
+Install it as `htb-init`:
+
+```bash
+sudo cp htb-init.sh /usr/local/bin/htb-init
+```
+
+Confirm installation:
+
+```bash
+which htb-init
+head -n 1 "$(which htb-init)"
+```
+
+Expected:
+
+```text
+/usr/local/bin/htb-init
+#!/usr/bin/env bash
+```
 
 ---
 
@@ -47,25 +111,6 @@ BOX="principal"
 IP="10.129.244.220"
 HOST="principal.htb"
 BASE_DIR="/home/zendeni/htb_labs/principal"
-```
-
----
-
-## Installation
-
-Place `htb-init` somewhere in your PATH.
-
-Example:
-
-```bash
-chmod +x htb-init
-sudo mv htb-init /usr/local/bin/htb-init
-```
-
-Confirm:
-
-```bash
-which htb-init
 ```
 
 ---
@@ -157,7 +202,7 @@ If `httpx` is missing, the generated `recon.sh` falls back to curl-based HTTP/HT
 └── tools/
 ```
 
-After `recon.sh` runs, it also creates files such as:
+After `recon.sh` runs, it also creates:
 
 ```text
 summary.md
@@ -188,7 +233,7 @@ The generated helper scripts source this file, which makes them location-aware a
 
 Safely updates `/etc/hosts` for the current target.
 
-Run:
+Run it from inside the box folder:
 
 ```bash
 ./update-hosts.sh
@@ -344,14 +389,14 @@ Linux privilege escalation checklist covering:
 ```text
 - Current user/context
 - sudo permissions
-- users/groups
+- Users and groups
 - SUID/SGID binaries
-- capabilities
-- writable paths
-- processes/services
-- cron jobs
-- interesting files
-- shell stabilization
+- Capabilities
+- Writable paths
+- Processes/services
+- Cron jobs
+- Interesting files
+- Shell stabilization
 ```
 
 ---
@@ -428,3 +473,11 @@ and a generated archive like:
 ```text
 bounty-recon-20260524-153000.zip
 ```
+
+---
+
+## Notes
+
+This tool is designed for personal HTB methodology, repeatability, and clean writeup preparation.
+
+It does not perform exploitation. It only creates a workspace and runs first-stage enumeration against machines you are authorized to test.
