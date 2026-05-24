@@ -402,7 +402,7 @@ echo "=============================="
 echo "[+] 0. Tool availability check"
 echo "=============================="
 
-for TOOL in nmap whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec; do
+for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec; do
     if have "$TOOL"; then
         echo "[+] $TOOL found"
     else
@@ -484,6 +484,12 @@ echo "=============================================="
 : > enum/web/curl-web-probe.txt
 
 for PORT in $(ports_lines); do
+    case "$PORT" in
+        21|22|25|53|88|110|111|135|139|143|389|445|464|593|636|993|995|1433|3268|3269|3389)
+            continue
+            ;;
+    esac
+
     echo "http://$IP:$PORT" >> enum/web/web-candidates.txt
     echo "https://$IP:$PORT" >> enum/web/web-candidates.txt
 done
@@ -523,7 +529,7 @@ if [ ! -s enum/web/live-web-urls.txt ]; then
     while read -r URL; do
         [ -z "$URL" ] && continue
 
-        CODE="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "$URL" || true)"
+        CODE="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 4 "$URL" || true)"
         echo "$URL $CODE" | tee -a enum/web/curl-web-probe.txt
 
         if [[ "$CODE" =~ ^(200|201|202|204|301|302|303|307|308|400|401|403|405|500|502|503)$ ]]; then
@@ -701,9 +707,9 @@ if ports_lines | grep -Eq '^(139|445)$'; then
     fi
 
     if have enum4linux-ng; then
-        enum4linux-ng "$IP" -oA enum/smb/enum4linux-ng || true
+        timeout 180 enum4linux-ng "$IP" -oA enum/smb/enum4linux-ng || true
     elif have enum4linux; then
-        enum4linux -a "$IP" | tee enum/smb/enum4linux.txt || true
+        timeout 180 enum4linux -a "$IP" | tee enum/smb/enum4linux.txt || true
     fi
 
     if have smbmap; then
@@ -1141,4 +1147,3 @@ echo "[+] Next commands:"
 echo "cd $BASE_DIR"
 echo "./update-hosts.sh"
 echo "./recon.sh"
-
