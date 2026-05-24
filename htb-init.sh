@@ -488,8 +488,20 @@ for PORT in $(ports_lines); do
     echo "https://$IP:$PORT" >> enum/web/web-candidates.txt
 done
 
+USE_HTTPX=false
+
 if have httpx; then
-    echo "[+] httpx found. Probing all open TCP ports for HTTP/HTTPS."
+    if httpx -h 2>&1 | grep -q -- '-l'; then
+        USE_HTTPX=true
+    else
+        echo "[!] httpx found, but it does not appear to be ProjectDiscovery httpx. Falling back to curl."
+    fi
+else
+    echo "[-] httpx not found. Falling back to curl-based probing."
+fi
+
+if [ "$USE_HTTPX" = true ]; then
+    echo "[+] ProjectDiscovery httpx found. Probing all open TCP ports for HTTP/HTTPS."
 
     httpx \
         -l enum/web/web-candidates.txt \
@@ -503,8 +515,10 @@ if have httpx; then
         -o enum/web/httpx-web-services.txt || true
 
     awk '{print $1}' enum/web/httpx-web-services.txt | sort -u > enum/web/live-web-urls.txt || true
-else
-    echo "[-] httpx not found. Falling back to curl-based probing."
+fi
+
+if [ ! -s enum/web/live-web-urls.txt ]; then
+    echo "[+] Running curl-based HTTP/HTTPS probing."
 
     while read -r URL; do
         [ -z "$URL" ] && continue
@@ -909,6 +923,10 @@ echo "=============================="
     echo
     cat enum/web/httpx-web-services.txt 2>/dev/null || true
     echo
+    echo "## Curl Web Probe"
+    echo
+    cat enum/web/curl-web-probe.txt 2>/dev/null || true
+    echo
     echo "## Web Fingerprinting"
     echo
     cat enum/web/whatweb-*.txt 2>/dev/null || true
@@ -951,6 +969,7 @@ echo "    scans/tcp-vuln.txt"
 echo "    scans/udp-top100.txt"
 echo "    scans/port-summary.md"
 echo "    enum/web/live-web-urls.txt"
+echo "    enum/web/curl-web-probe.txt"
 echo "    enum/interesting-grep.txt"
 echo "    enum/"
 echo "    notes.md"
@@ -983,7 +1002,7 @@ hostname
 pwd
 uname -a
 cat /etc/os-release
-```
+````
 
 ## Sudo
 
@@ -1054,55 +1073,58 @@ python3 -c 'import pty; pty.spawn("/bin/bash")'
 export TERM=xterm
 stty rows 40 columns 120
 ```
+
 EOF
 
 cat > README.md <<EOF
+
 # $BOX HTB Workspace
 
 ## Target
 
-- Box: \`$BOX\`
-- IP: \`$IP\`
-- Hostname: \`$HOST\`
+* Box: `$BOX`
+* IP: `$IP`
+* Hostname: `$HOST`
 
 ## Recommended Launch Flow
 
-\`\`\`bash
+```bash
 cd $BASE_DIR
 ./update-hosts.sh
 ./recon.sh
 less summary.md
-\`\`\`
+```
 
 ## Main Files
 
-- \`.target.env\` - machine-local config
-- \`summary.md\` - generated recon summary
-- \`notes.md\` - working notes
-- \`writeup.md\` - final report/writeup
-- \`recon.sh\` - automated first-stage recon
-- \`update-hosts.sh\` - update /etc/hosts for this box
-- \`zip-recon.sh\` - archive recon results
-- \`privesc-linux.md\` - local Linux privilege escalation checklist
-- \`recon-console.log\` - full terminal output from recon
-- \`scans/\` - Nmap outputs
-- \`enum/\` - service-specific enumeration outputs
+* `.target.env` - machine-local config
+* `summary.md` - generated recon summary
+* `notes.md` - working notes
+* `writeup.md` - final report/writeup
+* `recon.sh` - automated first-stage recon
+* `update-hosts.sh` - update /etc/hosts for this box
+* `zip-recon.sh` - archive recon results
+* `privesc-linux.md` - local Linux privilege escalation checklist
+* `recon-console.log` - full terminal output from recon
+* `scans/` - Nmap outputs
+* `enum/` - service-specific enumeration outputs
 
 ## Useful Review Commands
 
-\`\`\`bash
+```bash
 cat scans/open-tcp-ports.txt
 cat scans/port-summary.md
 cat enum/web/live-web-urls.txt
+cat enum/web/curl-web-probe.txt
 cat enum/interesting-grep.txt
 less summary.md
-\`\`\`
+```
 
 ## Zip Recon Manually
 
-\`\`\`bash
+```bash
 ./zip-recon.sh
-\`\`\`
+```
 EOF
 
 echo "[+] Done."
@@ -1115,3 +1137,5 @@ echo "[+] Next commands:"
 echo "cd $BASE_DIR"
 echo "./update-hosts.sh"
 echo "./recon.sh"
+
+```
