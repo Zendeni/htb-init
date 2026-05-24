@@ -1,4 +1,3 @@
-````markdown
 # htb-init
 
 `htb-init` is a small Bash helper script for creating a clean Hack The Box workspace for a new machine.
