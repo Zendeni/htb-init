@@ -9,7 +9,7 @@ It creates the folder structure, target configuration, helper scripts, starter n
 
 ```bash
 htb-init <box-name> <target-ip>
-````
+```
 
 Example:
 
