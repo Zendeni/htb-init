@@ -28,7 +28,7 @@ fi
 
 IFS='.' read -r o1 o2 o3 o4 <<< "$IP"
 for octet in "$o1" "$o2" "$o3" "$o4"; do
-    if (( 10#$octet > 255 )); then
+    if (( octet < 0 || octet > 255 )); then
         echo "[-] Invalid IPv4 address octet: $octet"
         exit 1
     fi
@@ -147,7 +147,7 @@ cat > writeup.md <<EOF
 
 ## Executive Summary
 
-The target machine \`$BOX\` was assessed as part of an authorized Hack The Box lab.
+The target machine \$BOX was assessed as part of an authorized Hack The Box lab.
 
 ## Target Information
 
@@ -608,7 +608,9 @@ if [ -s enum/web/live-web-urls.txt ]; then
         done < "enum/web/js-files-$SAFE_URL.txt"
 
         grep -RiE "api|admin|login|token|jwt|auth|secret|\bkey\b|debug|dashboard|credentials?|password|jwks|jwe|jws|pac4j" \
-            enum/web/js-* 2>/dev/null | tee "enum/web/js-interesting-$SAFE_URL.txt" || true
+            enum/web/js-* \
+            --exclude="js-interesting-*.txt" \
+            2>/dev/null | tee "enum/web/js-interesting-$SAFE_URL.txt" || true
 
         if have feroxbuster; then
             echo "[+] Running feroxbuster"
@@ -889,7 +891,13 @@ echo "=============================="
 echo "[+] 18. Interesting grep"
 echo "=============================="
 
-grep -RiE "admin|login|dashboard|api|jwt|token|auth|credentials?|password|passwd|ssh|private key|id_rsa|backup|bak|old|debug|dev|test|staging|pac4j|jwe|jws|jwks|principal|root|secret|\bkey\b" \
+grep -RiE \
+    --exclude="interesting-grep.txt" \
+    --exclude="summary.md" \
+    --exclude="recon-console.log" \
+    --exclude="*.zip" \
+    --exclude="ffuf-vhosts-*.json" \
+    "admin|login|dashboard|api|jwt|token|auth|credentials?|password|passwd|ssh|private key|id_rsa|backup|bak|old|debug|dev|test|staging|pac4j|jwe|jws|jwks|principal|root|secret|\bkey\b" \
     scans enum 2>/dev/null | tee enum/interesting-grep.txt || true
 
 echo
@@ -936,11 +944,9 @@ echo "=============================="
     grep -RiE "server:|x-powered-by:|set-cookie:|location:|authorization|jwt|token|pac4j|spring|jetty|tomcat|nginx|apache" enum/web/ 2>/dev/null || true
     echo
     echo "## Ferox Results"
-    echo
     grep -hE "^[0-9]{3}" enum/web/ferox-*.txt 2>/dev/null || true
     echo
     echo "## FFUF Vhost Results"
-    echo
     if have jq; then
         for f in enum/web/ffuf-vhosts-*.json; do
             [ -f "$f" ] && jq -r '.results[]? | "\(.status) \(.length) \(.words) \(.host) \(.url)"' "$f" 2>/dev/null || true
@@ -950,11 +956,9 @@ echo "=============================="
     fi
     echo
     echo "## Interesting Grep Results"
-    echo
     cat enum/interesting-grep.txt 2>/dev/null || true
     echo
     echo "## Files To Review"
-    echo
     find scans enum -type f -size +0c | sort
 } > summary.md
 
@@ -1073,64 +1077,59 @@ python3 -c 'import pty; pty.spawn("/bin/bash")'
 export TERM=xterm
 stty rows 40 columns 120
 ```
+
 EOF
 
-cat > README.md <<'EOF'
-# __BOX__ HTB Workspace
+cat > README.md <<EOF
+
+# $BOX HTB Workspace
 
 ## Target
 
-- Box: `__BOX__`
-- IP: `__IP__`
-- Hostname: `__HOST__`
+* Box: $BOX
+* IP: $IP
+* Hostname: $HOST
 
 ## Recommended Launch Flow
 
-```bash
-cd __BASE_DIR__
+\`\`\`bash
+cd $BASE_DIR
 ./update-hosts.sh
 ./recon.sh
 less summary.md
-```
+\`\`\`
 
 ## Main Files
 
-- `.target.env` - machine-local config
-- `summary.md` - generated recon summary
-- `notes.md` - working notes
-- `writeup.md` - final report/writeup
-- `recon.sh` - automated first-stage recon
-- `update-hosts.sh` - update /etc/hosts for this box
-- `zip-recon.sh` - archive recon results
-- `privesc-linux.md` - local Linux privilege escalation checklist
-- `recon-console.log` - full terminal output from recon
-- `scans/` - Nmap outputs
-- `enum/` - service-specific enumeration outputs
+* .target.env - machine-local config
+* summary.md - generated recon summary
+* notes.md - working notes
+* writeup.md - final report/writeup
+* recon.sh - automated first-stage recon
+* update-hosts.sh - update /etc/hosts for this box
+* zip-recon.sh - archive recon results
+* privesc-linux.md - local Linux privilege escalation checklist
+* recon-console.log - full terminal output from recon
+* scans/ - Nmap outputs
+* enum/ - service-specific enumeration outputs
 
 ## Useful Review Commands
 
-```bash
+\`\`\`bash
 cat scans/open-tcp-ports.txt
 cat scans/port-summary.md
 cat enum/web/live-web-urls.txt
 cat enum/web/curl-web-probe.txt
 cat enum/interesting-grep.txt
 less summary.md
-```
+\`\`\`
 
 ## Zip Recon Manually
 
-```bash
+\`\`\`bash
 ./zip-recon.sh
-```
+\`\`\`
 EOF
-
-sed -i \
-    -e "s|__BOX__|$BOX|g" \
-    -e "s|__IP__|$IP|g" \
-    -e "s|__HOST__|$HOST|g" \
-    -e "s|__BASE_DIR__|$BASE_DIR|g" \
-    README.md
 
 echo "[+] Done."
 echo "[+] Workspace created at: $BASE_DIR"
@@ -1142,3 +1141,4 @@ echo "[+] Next commands:"
 echo "cd $BASE_DIR"
 echo "./update-hosts.sh"
 echo "./recon.sh"
+
