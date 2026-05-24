@@ -28,7 +28,7 @@ fi
 
 IFS='.' read -r o1 o2 o3 o4 <<< "$IP"
 for octet in "$o1" "$o2" "$o3" "$o4"; do
-    if (( octet < 0 || octet > 255 )); then
+    if (( 10#$octet > 255 )); then
         echo "[-] Invalid IPv4 address octet: $octet"
         exit 1
     fi
@@ -1002,7 +1002,7 @@ hostname
 pwd
 uname -a
 cat /etc/os-release
-````
+```
 
 ## Sudo
 
@@ -1073,23 +1073,21 @@ python3 -c 'import pty; pty.spawn("/bin/bash")'
 export TERM=xterm
 stty rows 40 columns 120
 ```
-
 EOF
 
-cat > README.md <<EOF
-
-# $BOX HTB Workspace
+cat > README.md <<'EOF'
+# __BOX__ HTB Workspace
 
 ## Target
 
-* Box: `$BOX`
-* IP: `$IP`
-* Hostname: `$HOST`
+- Box: `__BOX__`
+- IP: `__IP__`
+- Hostname: `__HOST__`
 
 ## Recommended Launch Flow
 
 ```bash
-cd $BASE_DIR
+cd __BASE_DIR__
 ./update-hosts.sh
 ./recon.sh
 less summary.md
@@ -1097,17 +1095,17 @@ less summary.md
 
 ## Main Files
 
-* `.target.env` - machine-local config
-* `summary.md` - generated recon summary
-* `notes.md` - working notes
-* `writeup.md` - final report/writeup
-* `recon.sh` - automated first-stage recon
-* `update-hosts.sh` - update /etc/hosts for this box
-* `zip-recon.sh` - archive recon results
-* `privesc-linux.md` - local Linux privilege escalation checklist
-* `recon-console.log` - full terminal output from recon
-* `scans/` - Nmap outputs
-* `enum/` - service-specific enumeration outputs
+- `.target.env` - machine-local config
+- `summary.md` - generated recon summary
+- `notes.md` - working notes
+- `writeup.md` - final report/writeup
+- `recon.sh` - automated first-stage recon
+- `update-hosts.sh` - update /etc/hosts for this box
+- `zip-recon.sh` - archive recon results
+- `privesc-linux.md` - local Linux privilege escalation checklist
+- `recon-console.log` - full terminal output from recon
+- `scans/` - Nmap outputs
+- `enum/` - service-specific enumeration outputs
 
 ## Useful Review Commands
 
@@ -1127,6 +1125,13 @@ less summary.md
 ```
 EOF
 
+sed -i \
+    -e "s|__BOX__|$BOX|g" \
+    -e "s|__IP__|$IP|g" \
+    -e "s|__HOST__|$HOST|g" \
+    -e "s|__BASE_DIR__|$BASE_DIR|g" \
+    README.md
+
 echo "[+] Done."
 echo "[+] Workspace created at: $BASE_DIR"
 echo
@@ -1137,5 +1142,3 @@ echo "[+] Next commands:"
 echo "cd $BASE_DIR"
 echo "./update-hosts.sh"
 echo "./recon.sh"
-
-```
