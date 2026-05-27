@@ -6,7 +6,7 @@ It creates a clean workspace for a new HTB machine, generates target configurati
 
 The repository also includes `analyze-recon.py`, a standalone offline analysis helper that reviews collected recon output and generates prioritized next-step suggestions.
 
-The workflow is intended for authorized Hack The Box labs only.
+The workflow is intended for  Hack The Box labs.
 
 ---
 
