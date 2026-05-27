@@ -181,8 +181,8 @@ nmap -sC -sV -Pn -p <ports> $IP -oN scans/tcp-services.txt
 \`\`\`bash
 cat enum/web/live-web-urls.txt
 whatweb <url>
-feroxbuster -u <url> -w /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt -x php,txt,html,js,bak,old,zip,tar,gz,conf,config,json,yml,xml,log -k
-ffuf -ac -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u <url>/ -H "Host: FUZZ.$HOST"
+feroxbuster -u <url> -w <web-wordlist> -x php,txt,html,js,bak,old,zip,tar,gz,conf,config,json,yml,xml,log -k
+ffuf -ac -w <dns-wordlist> -u <url>/ -H "Host: FUZZ.$HOST"
 \`\`\`
 
 ## 1.4 Service Summary
@@ -391,6 +391,38 @@ safe_name() {
     echo "$1" | sed 's#[/:?&=.]#_#g'
 }
 
+pick_first_file() {
+    for candidate in "$@"; do
+        if [ -f "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+truncate_lines() {
+    cut -c1-300
+}
+
+WEB_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt \
+    /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
+    /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt \
+    /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt \
+    || true)"
+
+DNS_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+    /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+    /usr/share/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt \
+    || true)"
+
+SNMP_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/SNMP/snmp.txt \
+    /usr/share/wordlists/seclists/Discovery/SNMP/snmp.txt \
+    || true)"
+
 mkdir -p scans enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other}
 
 echo "[+] Starting recon for $BOX / $IP"
@@ -413,6 +445,25 @@ done | tee scans/tool-check.txt
 if ! have nmap; then
     echo "[-] nmap is required."
     exit 1
+fi
+
+echo
+if [ -n "$WEB_WORDLIST" ]; then
+    echo "[+] Web wordlist: $WEB_WORDLIST"
+else
+    echo "[!] No web directory wordlist found. Feroxbuster will be skipped."
+fi
+
+if [ -n "$DNS_WORDLIST" ]; then
+    echo "[+] DNS wordlist: $DNS_WORDLIST"
+else
+    echo "[!] No DNS subdomain wordlist found. ffuf/gobuster DNS wordlist modes will be skipped."
+fi
+
+if [ -n "$SNMP_WORDLIST" ]; then
+    echo "[+] SNMP wordlist: $SNMP_WORDLIST"
+else
+    echo "[!] No SNMP community wordlist found. onesixtyone will be skipped."
 fi
 
 echo
@@ -613,32 +664,47 @@ if [ -s enum/web/live-web-urls.txt ]; then
             fi
         done < "enum/web/js-files-$SAFE_URL.txt"
 
-        grep -RiE "api|admin|login|token|jwt|auth|secret|\bkey\b|debug|dashboard|credentials?|password|jwks|jwe|jws|pac4j" \
-            enum/web/js-* \
-            --exclude="js-interesting-*.txt" \
-            2>/dev/null | tee "enum/web/js-interesting-$SAFE_URL.txt" || true
+        echo "[+] Grepping downloaded JavaScript for interesting strings (noise-limited)"
+        find enum/web -maxdepth 1 -type f \
+            \( -name "js-$SAFE_URL-*" -o -name "js-host-$SAFE_URL-*" \) \
+            ! -name "*tailwind*" \
+            ! -name "*polyfills*" \
+            ! -name "*webpack*" \
+            ! -name "*.map" \
+            -print0 2>/dev/null \
+            | xargs -0 grep -HniI -E "api|admin|login|token|jwt|auth|secret|\bkey\b|debug|dashboard|credentials?|password|jwks|jwe|jws|pac4j|fetch|axios|/api/|localStorage|sessionStorage" 2>/dev/null \
+            | truncate_lines \
+            | tee "enum/web/js-interesting-$SAFE_URL.txt" || true
 
         if have feroxbuster; then
-            echo "[+] Running feroxbuster"
-            feroxbuster \
-                -u "$URL" \
-                -w /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
-                -x php,txt,html,js,bak,old,zip,tar,gz,conf,config,json,yml,xml,log \
-                -k \
-                --auto-tune \
-                --collect-words \
-                --collect-backups \
-                -o "enum/web/ferox-$SAFE_URL.txt" || true
+            if [ -n "$WEB_WORDLIST" ]; then
+                echo "[+] Running feroxbuster with $WEB_WORDLIST"
+                feroxbuster \
+                    -u "$URL" \
+                    -w "$WEB_WORDLIST" \
+                    -x php,txt,html,js,bak,old,zip,tar,gz,conf,config,json,yml,xml,log \
+                    -k \
+                    --auto-tune \
+                    --collect-words \
+                    --collect-backups \
+                    -o "enum/web/ferox-$SAFE_URL.txt" || true
+            else
+                echo "[!] Skipping feroxbuster: no web wordlist found."
+            fi
         fi
 
         if have ffuf; then
-            echo "[+] Running ffuf vhost discovery"
-            ffuf \
-                -ac \
-                -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
-                -u "$URL/" \
-                -H "Host: FUZZ.$HOST" \
-                -o "enum/web/ffuf-vhosts-$SAFE_URL.json" || true
+            if [ -n "$DNS_WORDLIST" ]; then
+                echo "[+] Running ffuf vhost discovery with $DNS_WORDLIST"
+                ffuf \
+                    -ac \
+                    -w "$DNS_WORDLIST" \
+                    -u "$URL/" \
+                    -H "Host: FUZZ.$HOST" \
+                    -o "enum/web/ffuf-vhosts-$SAFE_URL.json" || true
+            else
+                echo "[!] Skipping ffuf vhost discovery: no DNS wordlist found."
+            fi
         fi
 
         if have nikto; then
@@ -684,11 +750,15 @@ if ports_lines | grep -q '^53$'; then
     fi
 
     if have gobuster; then
-        gobuster dns \
-            -d "$HOST" \
-            -r "$IP" \
-            -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
-            -o enum/dns/gobuster-dns.txt || true
+        if [ -n "$DNS_WORDLIST" ]; then
+            gobuster dns \
+                -d "$HOST" \
+                -r "$IP" \
+                -w "$DNS_WORDLIST" \
+                -o enum/dns/gobuster-dns.txt || true
+        else
+            echo "[!] Skipping gobuster DNS: no DNS wordlist found."
+        fi
     fi
 else
     echo "[-] DNS port not detected."
@@ -802,7 +872,11 @@ echo "=============================="
 
 if grep -q '161/udp.*open' scans/udp-top100.txt 2>/dev/null; then
     if have onesixtyone; then
-        onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt "$IP" | tee enum/snmp/onesixtyone.txt || true
+        if [ -n "$SNMP_WORDLIST" ]; then
+            onesixtyone -c "$SNMP_WORDLIST" "$IP" | tee enum/snmp/onesixtyone.txt || true
+        else
+            echo "[!] Skipping onesixtyone: no SNMP community wordlist found."
+        fi
     fi
 
     if have snmpwalk; then
@@ -897,14 +971,21 @@ echo "=============================="
 echo "[+] 18. Interesting grep"
 echo "=============================="
 
-grep -RiE \
+grep -RniI \
     --exclude="interesting-grep.txt" \
     --exclude="summary.md" \
     --exclude="recon-console.log" \
     --exclude="*.zip" \
+    --exclude="*.map" \
     --exclude="ffuf-vhosts-*.json" \
+    --exclude="*tailwind*" \
+    --exclude="*polyfills*" \
+    --exclude="*webpack*" \
+    --exclude="package-lock.json" \
     "admin|login|dashboard|api|jwt|token|auth|credentials?|password|passwd|ssh|private key|id_rsa|backup|bak|old|debug|dev|test|staging|pac4j|jwe|jws|jwks|principal|root|secret|\bkey\b" \
-    scans enum 2>/dev/null | tee enum/interesting-grep.txt || true
+    scans enum 2>/dev/null \
+    | truncate_lines \
+    | tee enum/interesting-grep.txt || true
 
 echo
 echo "=============================="
@@ -947,7 +1028,14 @@ echo "=============================="
     echo
     echo "## Interesting Web Headers"
     echo
-    grep -RiE "server:|x-powered-by:|set-cookie:|location:|authorization|jwt|token|pac4j|spring|jetty|tomcat|nginx|apache" enum/web/ 2>/dev/null || true
+    grep -RniI \
+        --exclude="*.map" \
+        --exclude="*tailwind*" \
+        --exclude="*polyfills*" \
+        --exclude="*webpack*" \
+        "server:|x-powered-by:|set-cookie:|location:|authorization|jwt|token|pac4j|spring|jetty|tomcat|nginx|apache" \
+        enum/web/ 2>/dev/null \
+        | truncate_lines || true
     echo
     echo "## Ferox Results"
     grep -hE "^[0-9]{3}" enum/web/ferox-*.txt 2>/dev/null || true
