@@ -58,6 +58,22 @@ HOST_LINE_RE = re.compile(r"^\s*HOST=\"?([^\"\n]+)\"?\s*$", re.MULTILINE)
 IP_LINE_RE = re.compile(r"^\s*IP=\"?([^\"\n]+)\"?\s*$", re.MULTILINE)
 BOX_LINE_RE = re.compile(r"^\s*BOX=\"?([^\"\n]+)\"?\s*$", re.MULTILINE)
 
+NEXT_WINDOW_RE = re.compile(
+    r"""window\.next\s*=\s*\{[^}]*?version\s*:\s*["']([^"']+)["'][^}]*?\}""",
+    re.IGNORECASE | re.DOTALL,
+)
+NEXT_VERSION_RE = re.compile(
+    r"""(?:Next\.js|next)["'\s:=/_-]{0,12}(?:version)?["'\s:=/_-]{0,12}(1[0-6]\.[0-9][0-9A-Za-z.\-]*)""",
+    re.IGNORECASE,
+)
+REACT_VERSION_RE = re.compile(
+    r"""(?:React|react)["'\s:=/_-]{0,12}(?:version)?["'\s:=/_-]{0,12}(1[789]\.[0-9][0-9A-Za-z.\-]*)""",
+    re.IGNORECASE,
+)
+NEXT_STATIC_RE = re.compile(r"""(?:src|href)=["']([^"']*/_next/static/[^"']+)["']""", re.IGNORECASE)
+HTTP_HEADER_RE = re.compile(r"""^([A-Za-z0-9-]+):\s*(.+)$""", re.MULTILINE)
+
+
 
 @dataclass
 class Port:
@@ -89,6 +105,12 @@ class ReconData:
     technologies: set[str] = field(default_factory=set)
     endpoints: set[str] = field(default_factory=set)
     js_files: set[str] = field(default_factory=set)
+    nextjs_versions: set[str] = field(default_factory=set)
+    react_versions: set[str] = field(default_factory=set)
+    nextjs_app_router: bool = False
+    rsc_indicators: set[str] = field(default_factory=set)
+    http_headers: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    nikto_likely_false_positives: list[str] = field(default_factory=list)
     forms: set[str] = field(default_factory=set)
     inputs: set[str] = field(default_factory=set)
     smb_shares: set[str] = field(default_factory=set)
@@ -235,8 +257,12 @@ def parse_web(data: ReconData) -> None:
                 low_url = url.lower()
                 if any(x in low_url for x in (
                     "w3.org", "schema.org", "microsoft.com", "robtex.com", "github.com",
-                    "developer.mozilla.org", "owasp.org", "netsparker.com", "nmap.org"
+                    "developer.mozilla.org", "owasp.org", "netsparker.com", "nmap.org",
+                    "nextjs.org", "react.dev"
                 )):
+                    continue
+                # Avoid tiny placeholder URLs commonly embedded in minified JS/tests.
+                if re.match(r"^https?://[a-z](?:[#/:?@]|$)", low_url):
                     continue
                 data.web_urls.add(url.rstrip(".,);:"))
 
@@ -262,6 +288,9 @@ def parse_web(data: ReconData) -> None:
                 if href.startswith("/") and len(href) > 1:
                     data.endpoints.add(html.unescape(href))
 
+        record_http_headers(data, text)
+        detect_nextjs_from_text(data, text, rel)
+        collect_nikto_noise(data, text)
         detect_tech_from_text(data, text)
 
 
@@ -280,6 +309,109 @@ def is_interesting_path(p: str) -> bool:
     return any(k in low for k in keywords)
 
 
+def version_tuple(version: str) -> tuple[int, int, int]:
+    """
+    Best-effort semver extraction. Non-numeric suffixes such as -rc are ignored.
+    Missing parts default to zero.
+    """
+    nums = re.findall(r"\d+", version.split("-", 1)[0])
+    parts = [int(x) for x in nums[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)  # type: ignore[return-value]
+
+
+def version_lt(version: str, fixed: str) -> bool:
+    return version_tuple(version) < version_tuple(fixed)
+
+
+def looks_like_nextjs(data: ReconData) -> bool:
+    tech = " ".join(sorted(data.technologies)).lower()
+    return (
+        "next.js" in tech
+        or bool(data.nextjs_versions)
+        or data.nextjs_app_router
+        or any("/_next/static/" in js for js in data.js_files)
+        or bool(data.rsc_indicators)
+    )
+
+
+def record_http_headers(data: ReconData, text: str) -> None:
+    for name, value in HTTP_HEADER_RE.findall(text):
+        lname = name.lower().strip()
+        if lname in {
+            "x-powered-by", "vary", "x-nextjs-cache", "x-nextjs-prerender",
+            "server", "content-type", "location", "refresh",
+            "content-security-policy", "x-frame-options",
+        }:
+            data.http_headers[lname].add(value.strip())
+
+
+def detect_nextjs_from_text(data: ReconData, text: str, rel: str = "") -> None:
+    low = text.lower()
+
+    if "x-powered-by: next.js" in low or "/_next/static/" in low or "window.next" in low:
+        data.technologies.add("Next.js")
+
+    for m in NEXT_WINDOW_RE.finditer(text):
+        version = m.group(1).strip()
+        data.nextjs_versions.add(version)
+        data.technologies.add(f"Next.js {version}")
+        snippet = m.group(0)
+        if re.search(r"appDir\s*:\s*!?0|appDir\s*:\s*true|appDir\s*:\s*!0", snippet):
+            data.nextjs_app_router = True
+            data.rsc_indicators.add("window.next appDir enabled")
+
+    # Backup version extraction from minified bundles / text output.
+    for m in re.finditer(r"""version\s*:\s*["'](1[0-6]\.[0-9][0-9A-Za-z.\-]*)["']""", text):
+        # Restrict generic version: extraction to Next-ish bundles/HTML to avoid many false positives.
+        if "next" in low or "/_next/" in rel.lower() or "appdir" in low:
+            version = m.group(1).strip()
+            data.nextjs_versions.add(version)
+            data.technologies.add(f"Next.js {version}")
+
+    for m in re.finditer(r"""appDir\s*:\s*(?:true|!0)""", text):
+        data.nextjs_app_router = True
+        data.rsc_indicators.add("appDir enabled")
+
+    for m in re.finditer(r"""version\s*=\s*["'](1[789]\.[0-9][0-9A-Za-z.\-]*)["']""", text):
+        version = m.group(1).strip()
+        if "react" in low or "react.dev" in low:
+            data.react_versions.add(version)
+            data.technologies.add(f"React {version}")
+
+    # Common React 19 RC strings in bundled apps.
+    for m in re.finditer(r"""19\.0\.0-rc-[0-9A-Za-z-]+""", text):
+        data.react_versions.add(m.group(0))
+        data.technologies.add(f"React {m.group(0)}")
+
+    if re.search(r"^vary:\s*.*\bRSC\b", text, re.IGNORECASE | re.MULTILINE):
+        data.rsc_indicators.add("Vary header contains RSC")
+
+    if re.search(r"^content-type:\s*text/x-component", text, re.IGNORECASE | re.MULTILINE):
+        data.rsc_indicators.add("text/x-component response")
+
+    if "next-router-state-tree" in low:
+        data.rsc_indicators.add("Next-Router-State-Tree header/path observed")
+
+    if "react server component" in low or "react-server-dom" in low:
+        data.rsc_indicators.add("React Server Components string observed")
+
+    for static_path in NEXT_STATIC_RE.findall(text):
+        data.js_files.add(html.unescape(static_path))
+
+
+def collect_nikto_noise(data: ReconData, text: str) -> None:
+    if "nikto" not in text.lower() and "vulnerable to cross site scripting" not in text.lower():
+        return
+    cms_noise = ("post nuke", "postnuke", "drupal", "ez publish", "mywebserver")
+    for line in text.splitlines():
+        low = line.lower()
+        if "vulnerable to cross site scripting" in low and any(x in low for x in cms_noise):
+            if len(line) > 260:
+                line = line[:260] + "..."
+            data.nikto_likely_false_positives.append(line.strip())
+
 def detect_tech_from_text(data: ReconData, text: str) -> None:
     patterns = [
         (r"pac4j-jwt/?([0-9.]+)?", "pac4j-jwt"),
@@ -296,6 +428,7 @@ def detect_tech_from_text(data: ReconData, text: str) -> None:
         (r"\bActive Directory LDAP\b", "Active Directory LDAP"),
         (r"\bMicrosoft Windows Kerberos\b", "Microsoft Kerberos"),
         (r"\bWindows Server 2022\b", "Windows Server 2022"),
+        (r"X-Powered-By:\s*Next\.js|/_next/static/|\bNext\.js\b", "Next.js"),
         (r"\bJWT\b", "JWT"),
         (r"\bJWE\b", "JWE"),
         (r"\bJWKS\b", "JWKS"),
@@ -321,6 +454,22 @@ def detect_tech_from_text(data: ReconData, text: str) -> None:
             else:
                 data.technologies.add(name)
 
+
+def normalize_web_ports(data: ReconData) -> None:
+    """
+    Nmap sometimes labels custom HTTP ports as unknown/ppp?. If the recon files
+    clearly show HTTP/Next.js on that port, relabel the service for the report.
+    """
+    for port in list(data.ports.values()):
+        port_s = str(port.number)
+        if any(f":{port_s}" in u for u in data.web_urls) or (
+            port.number == 3000 and looks_like_nextjs(data)
+        ):
+            if not port.service or port.service.lower() in {"ppp?", "unknown"}:
+                port.service = "http"
+            if looks_like_nextjs(data) and "next.js" not in port.version.lower():
+                version = ", ".join(sorted(data.nextjs_versions))
+                port.version = f"Next.js {version}".strip()
 
 def parse_smb(data: ReconData) -> None:
     for rel, text in data.files.items():
@@ -394,6 +543,7 @@ def load_recon(root: Path, source: Path) -> ReconData:
     parse_target_env(data)
     parse_ports(data)
     parse_web(data)
+    normalize_web_ports(data)
     parse_smb(data)
     parse_ad_dns_ldap(data)
     parse_interesting(data)
@@ -428,7 +578,7 @@ def detect_profile(data: ReconData) -> list[str]:
     else:
         profiles.append("Linux/Unix or unknown")
 
-    if any(p in ports for p in (80, 443, 8080, 8000, 8443, 9000, 9090, 10000)) or data.web_urls:
+    if any(p in ports for p in (80, 443, 3000, 5000, 8000, 8080, 8443, 9000, 9090, 10000)) or data.web_urls:
         profiles.append("Web application")
     if 445 in ports:
         profiles.append("SMB exposed")
@@ -452,6 +602,92 @@ def build_findings(data: ReconData) -> list[Finding]:
     tech = " ".join(sorted(data.technologies)).lower()
     endpoints_low = {e.lower() for e in data.endpoints}
     shares_low = {s.lower() for s in data.smb_shares}
+
+    # Diagnostic fallback: no ports means recon/connectivity failed or target is unusual.
+    if not data.ports:
+        findings.append(Finding(
+            "No open ports parsed from recon output",
+            "The analyzer did not parse any confirmed open ports. Before chasing exploits, verify target IP, VPN route, machine state, and whether the TCP discovery scan actually completed.",
+            "high",
+            evidence=[
+                "No entries matched '<port>/tcp open' or the port summary table.",
+                f"Target: {data.ip or data.host or 'unknown'}",
+            ],
+            commands=[
+                f"ip route get {data.ip or '<target-ip>'}",
+                f"ping -c 3 {data.ip or '<target-ip>'}",
+                f"sudo nmap -p- -sS -Pn --reason --max-retries 3 --min-rate 1000 {data.ip or '<target-ip>'} -oN scans/tcp-full-retry.txt",
+                f"sudo nmap -Pn --reason -p 21,22,25,53,80,88,111,135,139,389,443,445,464,593,636,3000,5000,8080,8443,5985,5986 {data.ip or '<target-ip>'} -oN scans/tcp-common-retry.txt",
+            ],
+        ))
+
+    # Next.js / React Server Components fingerprinting.
+    if looks_like_nextjs(data):
+        evidence = []
+        if data.nextjs_versions:
+            evidence.append("Next.js version(s): " + ", ".join(sorted(data.nextjs_versions)))
+        if data.react_versions:
+            evidence.append("React version(s): " + ", ".join(sorted(data.react_versions)))
+        if data.nextjs_app_router:
+            evidence.append("App Router/appDir enabled")
+        if data.rsc_indicators:
+            evidence.append("RSC indicators: " + ", ".join(sorted(data.rsc_indicators)))
+        if data.js_files:
+            evidence.append("Next static JS chunks: " + ", ".join(sorted([j for j in data.js_files if "/_next/static/" in j])[:5]))
+
+        commands = [
+            "grep -Rho 'window.next={[^}]*}' enum/web/js-* enum/web/*.html 2>/dev/null | sort -u",
+            "grep -RhoE '19\\.0\\.0-rc-[0-9A-Za-z-]+' enum/web/js-* enum/web/*.html 2>/dev/null | sort -u",
+            f"curl -i http://{data.host or data.ip}:3000/ -H 'RSC: 1'",
+            f"curl -i 'http://{data.host or data.ip}:3000/?_rsc=test'",
+            "grep -RniE 'server action|server function|use server|react-server-dom|Next-Router-State-Tree|x-action|_rsc|appDir' enum/web/",
+        ]
+
+        high_risk = False
+        for v in data.nextjs_versions:
+            # Next.js 15.0.3-like versions are below the known fixed versions for both the
+            # RSC advisory line and middleware authorization bypass checks.
+            if version_tuple(v) >= (15, 0, 0) and version_lt(v, "15.0.5") and (data.nextjs_app_router or data.rsc_indicators):
+                high_risk = True
+
+        detail = (
+            "Next.js/App Router/RSC artifacts were detected. This is high-value because modern Next.js attack paths may be framework-level and may not require visible forms or obvious inputs."
+            if high_risk else
+            "Next.js artifacts were detected. Review framework version, App Router/RSC behavior, middleware, routes, and server actions before generic brute forcing."
+        )
+
+        findings.append(Finding(
+            "Next.js / React Server Components attack surface",
+            detail,
+            "high" if high_risk else "medium",
+            evidence=evidence or ["Next.js-like artifacts detected"],
+            commands=commands,
+        ))
+
+        # Middleware bypass check is only useful when protected routes exist, but version-wise it deserves a note.
+        if any(version_tuple(v) >= (15, 0, 0) and version_lt(v, "15.2.3") for v in data.nextjs_versions):
+            findings.append(Finding(
+                "Next.js middleware authorization-bypass candidate",
+                "The detected Next.js version is in a range where middleware-based authorization bypass should be manually tested if protected routes such as /admin or /dashboard exist.",
+                "medium",
+                evidence=["Next.js version(s): " + ", ".join(sorted(data.nextjs_versions))],
+                commands=[
+                    f"for p in admin dashboard login internal monitor monitoring api/status api/health; do echo ===== /$p =====; curl -s -i http://{data.host or data.ip}:3000/$p | head -n 20; done",
+                    f"curl -i http://{data.host or data.ip}:3000/admin -H 'x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware'",
+                ],
+            ))
+
+    if data.nikto_likely_false_positives and looks_like_nextjs(data):
+        findings.append(Finding(
+            "Likely Nikto CMS/XSS false positives",
+            "Nikto reported old CMS XSS signatures, but the app fingerprints as Next.js. Treat these as low-confidence noise unless you can prove reflection in this app.",
+            "low",
+            evidence=data.nikto_likely_false_positives[:6],
+            commands=[
+                "grep -RniE 'vulnerable to Cross Site Scripting|Post Nuke|Drupal|eZ publish|MyWebServer' enum/web/nikto-*",
+                "Manually verify reflection before documenting XSS as a finding.",
+            ],
+        ))
 
     # AD/DC fingerprint.
     if {53, 88, 389, 445}.issubset(ports) or "active directory" in tech:
@@ -566,7 +802,7 @@ def build_findings(data: ReconData) -> list[Finding]:
         ))
 
     # Web app general.
-    if data.web_urls or data.endpoints or any(p in ports for p in (80, 443, 8080, 8000, 8443, 9000, 9090, 10000)):
+    if data.web_urls or data.endpoints or any(p in ports for p in (80, 443, 3000, 5000, 8000, 8080, 8443, 9000, 9090, 10000)):
         commands = [
             "cat enum/web/live-web-urls.txt",
             "grep -RniE \"fetch|axios|/api/|token|auth|login|admin|dashboard|password|secret\" enum/web/",
@@ -616,6 +852,14 @@ def build_findings(data: ReconData) -> list[Finding]:
 def cve_search_suggestions(data: ReconData) -> list[str]:
     suggestions = []
     techs = sorted(data.technologies)
+    # High-signal framework suggestions.
+    if looks_like_nextjs(data):
+        if data.nextjs_versions:
+            versions = ", ".join(sorted(data.nextjs_versions))
+            suggestions.append(f"Next.js {versions} App Router RSC CVE-2025-66478 React Server Components RCE fixed 15.0.5")
+            suggestions.append(f"Next.js {versions} CVE-2025-29927 x-middleware-subrequest authorization bypass fixed 15.2.3")
+        else:
+            suggestions.append("Next.js App Router React Server Components RSC vulnerability check")
     for t in techs:
         low = t.lower()
         if "pac4j-jwt" in low:
@@ -688,6 +932,26 @@ def render_report(data: ReconData, findings: list[Finding]) -> str:
     else:
         lines.append("_No technology indicators parsed._")
     lines.append("")
+
+
+    if looks_like_nextjs(data):
+        lines.append("## Next.js / React Intelligence")
+        lines.append("")
+        if data.nextjs_versions:
+            lines.append("- Next.js version(s): `" + "`, `".join(sorted(data.nextjs_versions)) + "`")
+        if data.react_versions:
+            lines.append("- React version(s): `" + "`, `".join(sorted(data.react_versions)) + "`")
+        lines.append(f"- App Router / appDir detected: `{'yes' if data.nextjs_app_router else 'unknown/no'}`")
+        if data.rsc_indicators:
+            lines.append("- RSC indicators:")
+            for i in sorted(data.rsc_indicators):
+                lines.append(f"  - `{i}`")
+        if data.http_headers:
+            lines.append("- High-signal HTTP headers:")
+            for h in sorted(data.http_headers):
+                vals = "; ".join(sorted(data.http_headers[h]))[:220]
+                lines.append(f"  - `{h}: {vals}`")
+        lines.append("")
 
     if data.web_urls or data.endpoints or data.js_files or data.forms or data.inputs:
         lines.append("## Web Intelligence")
