@@ -43,7 +43,7 @@ echo "[+] Target IP: $IP"
 echo "[+] Hostname: $HOST"
 echo "[+] Workspace: $BASE_DIR"
 
-mkdir -p "$BASE_DIR"/{scans,enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other},loot,exploits,shells,screenshots,tools}
+mkdir -p "$BASE_DIR"/{scans,enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other},loot/{copied,searches},exploits,shells,screenshots,tools}
 cd "$BASE_DIR"
 
 cat > .target.env <<EOF
@@ -325,6 +325,8 @@ zip -r "$OUTFILE" \
     writeup.md \
     README.md \
     recon.sh \
+    search-recon.sh \
+    file-hunt.sh \
     update-hosts.sh \
     zip-recon.sh \
     privesc-linux.md \
@@ -345,6 +347,102 @@ EOF
 
 chmod +x zip-recon.sh
 
+cat > search-recon.sh <<'EOF'
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "Usage: ./search-recon.sh <regex-or-string> [--copy]"
+    echo "Example: ./search-recon.sh 'password|token|backup' --copy"
+    exit 1
+fi
+
+PATTERN="$1"
+COPY_MATCHES="${2:-}"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+OUTFILE="loot/searches/recon-search-${TIMESTAMP}.txt"
+
+mkdir -p loot/searches loot/copied
+
+echo "[+] Searching recon output for: $PATTERN"
+echo "[+] Writing matches to: $OUTFILE"
+
+if command -v rg >/dev/null 2>&1; then
+    rg -n --hidden --glob '!*.zip' --glob '!loot/copied/**' --glob '!recon-console.log' "$PATTERN" scans enum notes.md writeup.md summary.md recon-analysis.md 2>/dev/null \
+        | tee "$OUTFILE" || true
+else
+    grep -RniI \
+        --exclude="*.zip" \
+        --exclude="recon-console.log" \
+        --exclude-dir="loot/copied" \
+        -E "$PATTERN" scans enum notes.md writeup.md summary.md recon-analysis.md 2>/dev/null \
+        | tee "$OUTFILE" || true
+fi
+
+if [ "$COPY_MATCHES" = "--copy" ]; then
+    echo "[+] Copying matched local files into loot/copied/"
+
+    cut -d: -f1 "$OUTFILE" \
+        | sort -u \
+        | while read -r FILE; do
+            [ -f "$FILE" ] || continue
+            REL="${FILE#./}"
+            DEST="loot/copied/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            cp "$FILE" "$DEST"
+        done
+fi
+
+echo "[+] Done."
+EOF
+
+chmod +x search-recon.sh
+
+cat > file-hunt.sh <<'EOF'
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "Usage: ./file-hunt.sh <filename-pattern> [root]"
+    echo "Example: ./file-hunt.sh 'config.php' /"
+    echo "Example: ./file-hunt.sh '*.bak' /var/www"
+    exit 1
+fi
+
+PATTERN="$1"
+ROOT="${2:-.}"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+OUTFILE="loot/searches/file-hunt-${TIMESTAMP}.txt"
+COPY_ROOT="loot/copied/file-hunt-${TIMESTAMP}"
+
+mkdir -p loot/searches "$COPY_ROOT"
+
+echo "[+] Finding readable files matching: *$PATTERN*"
+echo "[+] Root: $ROOT"
+echo "[+] Writing file list to: $OUTFILE"
+
+find "$ROOT" -type f -iname "*$PATTERN*" -readable -size -20M -print 2>/dev/null \
+    | tee "$OUTFILE" || true
+
+echo "[+] Copying readable matches under: $COPY_ROOT"
+
+while read -r FILE; do
+    [ -f "$FILE" ] || continue
+    REL="${FILE#/}"
+    DEST="$COPY_ROOT/$REL"
+    mkdir -p "$(dirname "$DEST")"
+    cp "$FILE" "$DEST" 2>/dev/null || true
+done < "$OUTFILE"
+
+echo "[+] Done. Review:"
+echo "    $OUTFILE"
+echo "    $COPY_ROOT"
+EOF
+
+chmod +x file-hunt.sh
+
 cat > recon.sh <<'EOF'
 #!/usr/bin/env bash
 
@@ -357,6 +455,29 @@ source ./.target.env
 exec > >(tee -a recon-console.log) 2>&1
 
 START_TIME="$(date)"
+
+# Runtime safety knobs. Defaults are intentionally conservative so recon does not
+# appear to hang in ffuf/ferox sections on dynamic or slow web targets.
+# Override per run, for example:
+#   ./recon.sh
+#   WEB_ENUM=0 ./recon.sh
+#   FEROX_EXTENSIONS=0 FEROX_COLLECT=0 ./recon.sh
+#   RECON_DEEP=1 FEROX_EXTENSIONS=1 FEROX_COLLECT=1 FFUF_CONTENT=1 ./recon.sh
+RECON_DEEP="${RECON_DEEP:-0}"
+WEB_ENUM="${WEB_ENUM:-1}"
+FEROX_ENABLE="${FEROX_ENABLE:-1}"
+FEROX_EXTENSIONS="${FEROX_EXTENSIONS:-0}"
+FEROX_COLLECT="${FEROX_COLLECT:-0}"
+FFUF_CONTENT="${FFUF_CONTENT:-0}"
+FFUF_VHOST="${FFUF_VHOST:-1}"
+FFUF_THREADS="${FFUF_THREADS:-15}"
+FFUF_RATE="${FFUF_RATE:-50}"
+FFUF_MAXTIME="${FFUF_MAXTIME:-180}"
+FEROX_MAXTIME="${FEROX_MAXTIME:-240}"
+FEROX_THREADS="${FEROX_THREADS:-10}"
+MAX_WEB_URLS="${MAX_WEB_URLS:-4}"
+MAX_WEB_WORDLISTS="${MAX_WEB_WORDLISTS:-1}"
+MAX_FFUF_WORDLISTS="${MAX_FFUF_WORDLISTS:-1}"
 
 have() {
     command -v "$1" >/dev/null 2>&1
@@ -405,11 +526,546 @@ truncate_lines() {
     cut -c1-300
 }
 
+run_with_timeout() {
+    local seconds="$1"
+    shift
+
+    if have timeout; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+append_unique_line() {
+    local value="$1"
+    local file="$2"
+
+    [ -n "$value" ] || return 0
+    touch "$file"
+    grep -Fxq "$value" "$file" 2>/dev/null || echo "$value" >> "$file"
+}
+
+add_wordlist() {
+    local wordlist="$1"
+    local plan_file="$2"
+
+    if [ -n "$wordlist" ] && [ -f "$wordlist" ]; then
+        append_unique_line "$wordlist" "$plan_file"
+    fi
+}
+
+profile_has() {
+    local profile_file="$1"
+    local name="$2"
+
+    grep -Fxq "$name" "$profile_file" 2>/dev/null
+}
+
+ffuf_extensions_arg() {
+    local extensions="$1"
+    echo "$extensions" | awk -F, '{
+        for (i = 1; i <= NF; i++) {
+            gsub(/^[.[:space:]]+|[[:space:]]+$/, "", $i)
+            if ($i != "") {
+                printf "%s.%s", sep, $i
+                sep=","
+            }
+        }
+    }'
+}
+
+wordlist_line_count() {
+    local wordlist="$1"
+    if [ -f "$wordlist" ]; then
+        grep -vE '^[[:space:]]*(#|$)' "$wordlist" 2>/dev/null | wc -l | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+should_scan_web_url() {
+    local url="$1"
+    local port
+    port="$(url_port "$url")"
+
+    # Keep default recon fast: scan normal web ports plus common HTB app ports.
+    # Deep mode scans every discovered live web URL.
+    if [ "$RECON_DEEP" = "1" ]; then
+        return 0
+    fi
+
+    case "$port" in
+        80|443|8000|8080|8443|3000|5000|9000|9090)
+            return 0
+            ;;
+        *)
+            echo "[!] Skipping heavy web fuzzing for $url in default mode. Enable with RECON_DEEP=1."
+            return 1
+            ;;
+    esac
+}
+
+detect_web_technologies() {
+    local safe_url="$1"
+    local profile_file="$2"
+    local tmp_file
+
+    tmp_file="$(mktemp)"
+    : > "$profile_file"
+
+    for candidate in \
+        "enum/web/whatweb-$safe_url.txt" \
+        "enum/web/whatweb-host-$safe_url.txt" \
+        "enum/web/headers-$safe_url.txt" \
+        "enum/web/headers-host-$safe_url.txt" \
+        "enum/web/index-$safe_url.html" \
+        "enum/web/index-host-$safe_url.html" \
+        "enum/web/robots.txt-$safe_url.txt" \
+        "enum/web/robots.txt-host-$safe_url.txt" \
+        "enum/web/openapi.json-$safe_url.txt" \
+        "enum/web/swagger.json-$safe_url.txt"; do
+        [ -f "$candidate" ] && cat "$candidate" >> "$tmp_file"
+    done
+
+    if grep -Eiq 'Drupal|X-Drupal|drupal-settings-json|/sites/default/|/core/misc/drupal|/misc/drupal\.js' "$tmp_file"; then
+        append_unique_line "drupal" "$profile_file"
+    fi
+    if grep -Eiq 'WordPress|wp-content|wp-includes|xmlrpc\.php' "$tmp_file"; then
+        append_unique_line "wordpress" "$profile_file"
+    fi
+    if grep -Eiq 'Joomla|/media/system/js|com_content|com_users' "$tmp_file"; then
+        append_unique_line "joomla" "$profile_file"
+    fi
+    if grep -Eiq '_next/static|Next\.js|x-powered-by:[[:space:]]*Next' "$tmp_file"; then
+        append_unique_line "nextjs" "$profile_file"
+    fi
+    if grep -Eiq 'Laravel|laravel_session|XSRF-TOKEN' "$tmp_file"; then
+        append_unique_line "laravel" "$profile_file"
+    fi
+    if grep -Eiq 'Spring|JSESSIONID|Whitelabel Error Page|X-Application-Context' "$tmp_file"; then
+        append_unique_line "java-spring" "$profile_file"
+    fi
+    if grep -Eiq 'Tomcat|Apache-Coyote|\.jsp|JSESSIONID' "$tmp_file"; then
+        append_unique_line "java-tomcat" "$profile_file"
+    fi
+    if grep -Eiq 'ASP\.NET|X-AspNet|__VIEWSTATE|\.aspx' "$tmp_file"; then
+        append_unique_line "aspnet" "$profile_file"
+    fi
+    if grep -Eiq 'PHPSESSID|X-Powered-By:[[:space:]]*PHP|\.php' "$tmp_file"; then
+        append_unique_line "php" "$profile_file"
+    fi
+    if grep -Eiq 'swagger|openapi|graphql|/api/' "$tmp_file"; then
+        append_unique_line "api" "$profile_file"
+    fi
+
+    if [ ! -s "$profile_file" ]; then
+        append_unique_line "generic-web" "$profile_file"
+    fi
+
+    rm -f "$tmp_file"
+}
+
+build_web_wordlist_plan() {
+    local profile_file="$1"
+    local plan_file="$2"
+
+    : > "$plan_file"
+    add_wordlist "$WEB_WORDLIST" "$plan_file"
+    add_wordlist "$WEB_FILES_WORDLIST" "$plan_file"
+
+    if profile_has "$profile_file" "drupal"; then
+        add_wordlist "$DRUPAL_WORDLIST" "$plan_file"
+        add_wordlist "$CMS_WORDLIST" "$plan_file"
+    fi
+    if profile_has "$profile_file" "wordpress"; then
+        add_wordlist "$WORDPRESS_WORDLIST" "$plan_file"
+        add_wordlist "$CMS_WORDLIST" "$plan_file"
+    fi
+    if profile_has "$profile_file" "joomla"; then
+        add_wordlist "$JOOMLA_WORDLIST" "$plan_file"
+        add_wordlist "$CMS_WORDLIST" "$plan_file"
+    fi
+    if profile_has "$profile_file" "api"; then
+        add_wordlist "$API_WORDLIST" "$plan_file"
+    fi
+
+    add_wordlist "$BACKUP_WORDLIST" "$plan_file"
+}
+
+web_extensions_for_profile() {
+    local profile_file="$1"
+    local extensions=""
+
+    # Default mode intentionally avoids huge extension multiplication.
+    # Deep mode enables broader extension lists.
+    if [ "$RECON_DEEP" = "1" ] || [ "$FEROX_EXTENSIONS" = "1" ]; then
+        extensions="txt,html,js,bak,old,zip,tar,gz,conf,config,json,yml,xml,log"
+    fi
+
+    if profile_has "$profile_file" "php" || profile_has "$profile_file" "drupal" || profile_has "$profile_file" "wordpress" || profile_has "$profile_file" "joomla" || profile_has "$profile_file" "laravel"; then
+        if [ -n "$extensions" ]; then
+            extensions="php,$extensions"
+        else
+            extensions="php"
+        fi
+    fi
+    if profile_has "$profile_file" "aspnet"; then
+        if [ -n "$extensions" ]; then
+            extensions="aspx,config,$extensions"
+        else
+            extensions="aspx"
+        fi
+    fi
+    if profile_has "$profile_file" "java-spring" || profile_has "$profile_file" "java-tomcat"; then
+        if [ -n "$extensions" ]; then
+            extensions="jsp,do,action,$extensions"
+        else
+            extensions="jsp"
+        fi
+    fi
+
+    echo "$extensions"
+}
+
+run_ferox_plan() {
+    local url="$1"
+    local safe_url="$2"
+    local plan_file="$3"
+    local extensions="$4"
+    local ran=false
+    local count=0
+    local label
+    local word_count
+    local ferox_args=()
+
+    if [ "$WEB_ENUM" != "1" ]; then
+        echo "[!] Skipping heavy web enumeration because WEB_ENUM=$WEB_ENUM."
+        return 0
+    fi
+
+    if [ "$FEROX_ENABLE" != "1" ]; then
+        echo "[!] Skipping feroxbuster because FEROX_ENABLE=$FEROX_ENABLE."
+        return 0
+    fi
+
+    if ! have feroxbuster; then
+        return 0
+    fi
+
+    if ! should_scan_web_url "$url"; then
+        return 0
+    fi
+
+    if [ ! -s "$plan_file" ]; then
+        echo "[!] Skipping feroxbuster: no usable web wordlists found."
+        return 0
+    fi
+
+    while read -r wordlist; do
+        [ -f "$wordlist" ] || continue
+
+        count=$((count + 1))
+        if [ "$count" -gt "$MAX_WEB_WORDLISTS" ]; then
+            echo "[!] Ferox wordlist budget reached. Skipping remaining wordlists for $url."
+            break
+        fi
+
+        word_count="$(wordlist_line_count "$wordlist")"
+        label="$(safe_name "$(basename "$wordlist")")"
+        ran=true
+
+        ferox_args=(
+            -u "$url"
+            -w "$wordlist"
+            -k
+            -d 1
+            -t "$FEROX_THREADS"
+            -o "enum/web/ferox-$safe_url-$label.txt"
+        )
+
+        if [ -n "$extensions" ]; then
+            ferox_args+=(-x "$extensions")
+        fi
+
+        if [ "$RECON_DEEP" = "1" ] || [ "$FEROX_COLLECT" = "1" ]; then
+            ferox_args+=(--collect-backups)
+        fi
+
+        echo "[+] Running fast-bounded feroxbuster with $wordlist"
+        echo "[+] Ferox budget: max ${FEROX_MAXTIME}s, threads ${FEROX_THREADS}, depth 1, wordlist lines ${word_count}, extensions '${extensions:-none}'"
+        run_with_timeout "$FEROX_MAXTIME" feroxbuster "${ferox_args[@]}" || true
+    done < "$plan_file"
+
+    if [ "$ran" = false ]; then
+        echo "[!] Skipping feroxbuster: planned wordlists were not present on disk."
+    fi
+}
+
+run_ffuf_content_plan() {
+    local url="$1"
+    local safe_url="$2"
+    local plan_file="$3"
+    local extensions="$4"
+    local profile_file="$5"
+    local ffuf_ext
+    local count=0
+    local label
+
+    if [ "$WEB_ENUM" != "1" ]; then
+        echo "[!] Skipping ffuf content discovery because WEB_ENUM=$WEB_ENUM."
+        return 0
+    fi
+
+    if ! have ffuf || [ ! -s "$plan_file" ]; then
+        return 0
+    fi
+
+    if ! should_scan_web_url "$url"; then
+        return 0
+    fi
+
+    if [ "$FFUF_CONTENT" != "1" ] && [ "$RECON_DEEP" != "1" ]; then
+        echo "[!] Skipping ffuf content discovery by default to avoid long duplicate scans."
+        echo "[!] To enable it: RECON_DEEP=1 FFUF_CONTENT=1 ./recon.sh"
+        return 0
+    fi
+
+    ffuf_ext="$(ffuf_extensions_arg "$extensions")"
+
+    while read -r wordlist; do
+        [ -f "$wordlist" ] || continue
+
+        # API wordlists already contain endpoint-style entries; adding many extensions
+        # multiplies requests without much value. CMS/generic content gets extensions.
+        local extra_args=()
+        if profile_has "$profile_file" "api" && [[ "$wordlist" == *"/api/"* ]]; then
+            extra_args=()
+        elif [ -n "$ffuf_ext" ]; then
+            extra_args=(-e "$ffuf_ext")
+        else
+            extra_args=()
+        fi
+
+        count=$((count + 1))
+        if [ "$count" -gt "$MAX_FFUF_WORDLISTS" ]; then
+            echo "[!] FFUF content wordlist budget reached. Skipping remaining wordlists for $url."
+            break
+        fi
+
+        label="$(safe_name "$(basename "$wordlist")")"
+        echo "[+] Running bounded ffuf content discovery with $wordlist"
+        run_with_timeout "$FFUF_MAXTIME" ffuf \
+            -noninteractive \
+            -ac \
+            -t "$FFUF_THREADS" \
+            -rate "$FFUF_RATE" \
+            -maxtime "$FFUF_MAXTIME" \
+            -w "$wordlist" \
+            -u "$url/FUZZ" \
+            "${extra_args[@]}" \
+            -of json \
+            -o "enum/web/ffuf-content-$safe_url-$label.json" || true
+    done < "$plan_file"
+}
+
+run_vhost_ffuf() {
+    local url="$1"
+    local safe_url="$2"
+    local scheme port lock_file
+
+    if [ "$WEB_ENUM" != "1" ]; then
+        echo "[!] Skipping ffuf vhost discovery because WEB_ENUM=$WEB_ENUM."
+        return 0
+    fi
+
+    if ! have ffuf; then
+        return 0
+    fi
+
+    if ! should_scan_web_url "$url"; then
+        return 0
+    fi
+
+    if [ "$FFUF_VHOST" != "1" ]; then
+        echo "[!] Skipping ffuf vhost discovery because FFUF_VHOST=$FFUF_VHOST."
+        return 0
+    fi
+
+    if [ -z "$DNS_WORDLIST" ]; then
+        echo "[!] Skipping ffuf vhost discovery: no DNS wordlist found."
+        return 0
+    fi
+
+    scheme="$(url_scheme "$url")"
+    port="$(url_port "$url")"
+    lock_file="enum/web/.ffuf-vhost-$scheme-$port.done"
+
+    if [ -f "$lock_file" ]; then
+        echo "[!] Skipping duplicate ffuf vhost scan for $scheme/$port."
+        return 0
+    fi
+    touch "$lock_file"
+
+    echo "[+] Running bounded ffuf vhost discovery with $DNS_WORDLIST"
+    run_with_timeout "$FFUF_MAXTIME" ffuf \
+        -noninteractive \
+        -ac \
+        -t "$FFUF_THREADS" \
+        -rate "$FFUF_RATE" \
+        -maxtime "$FFUF_MAXTIME" \
+        -w "$DNS_WORDLIST" \
+        -u "$url/" \
+        -H "Host: FUZZ.$HOST" \
+        -of json \
+        -o "enum/web/ffuf-vhosts-$safe_url.json" || true
+}
+
+run_cms_specific_checks() {
+    local url="$1"
+    local safe_url="$2"
+    local profile_file="$3"
+
+    if profile_has "$profile_file" "drupal"; then
+        echo "[+] Drupal profile detected; checking Drupal-specific paths and scanners."
+        for path in CHANGELOG.txt core/CHANGELOG.txt user/login user/register node sites/default/files/ sites/default/settings.php; do
+            safe_path="$(echo "$path" | sed 's#[/]#_#g')"
+            curl -k -s -i "$url/$path" -o "enum/web/drupal-$safe_path-$safe_url.txt" || true
+        done
+        if have droopescan; then
+            run_with_timeout 900 droopescan scan drupal -u "$url" | tee "enum/web/droopescan-$safe_url.txt" || true
+        fi
+        if have nuclei; then
+            nuclei -u "$url" -tags drupal,cms -severity low,medium,high,critical -o "enum/web/nuclei-drupal-$safe_url.txt" || true
+        fi
+    fi
+
+    if profile_has "$profile_file" "wordpress" && have wpscan; then
+        echo "[+] WordPress profile detected; running bounded WPScan."
+        run_with_timeout 900 wpscan --url "$url" --disable-tls-checks --enumerate vp,vt,u -o "enum/web/wpscan-$safe_url.txt" || true
+    fi
+
+    if profile_has "$profile_file" "joomla" && have joomscan; then
+        echo "[+] Joomla profile detected; running bounded joomscan."
+        run_with_timeout 900 joomscan -u "$url" | tee "enum/web/joomscan-$safe_url.txt" || true
+    fi
+
+    if profile_has "$profile_file" "api"; then
+        echo "[+] API indicators detected; checking common API docs and GraphQL paths."
+        for path in api api/v1 api/v2 graphql graphiql swagger swagger-ui openapi.json swagger.json docs redoc; do
+            safe_path="$(echo "$path" | sed 's#[/]#_#g')"
+            curl -k -s -i "$url/$path" -o "enum/web/api-$safe_path-$safe_url.txt" || true
+        done
+    fi
+}
+
+extract_dns_hostnames() {
+    local host_regex
+
+    host_regex="$(printf '%s' "$HOST" | sed 's/[][\\.^$*+?{}|()]/\\&/g')"
+    : > enum/dns/discovered-hostnames.txt
+
+    grep -RhoE "([A-Za-z0-9_-]+\.)*$host_regex" enum/dns enum/web 2>/dev/null \
+        | sed 's/^[*.]*//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | sort -u \
+        > enum/dns/discovered-hostnames.txt || true
+
+    grep -Fxv "$HOST" enum/dns/discovered-hostnames.txt > enum/dns/discovered-subdomains.txt || true
+
+    while read -r name; do
+        [ -n "$name" ] && echo "$IP $name"
+    done < enum/dns/discovered-hostnames.txt > enum/dns/hosts-additions.txt
+}
+
+probe_discovered_hostnames() {
+    local ports_to_probe name port scheme url code
+
+    : > enum/web/discovered-host-web-probe.txt
+    : > enum/web/discovered-host-web-urls.txt
+
+    if [ ! -s enum/dns/discovered-hostnames.txt ]; then
+        return 0
+    fi
+
+    ports_to_probe="$(ports_lines | grep -E '^(80|443|8000|8080|8443|3000|5000|9000|9090)$' | sort -nu | tr '\n' ' ')"
+    [ -n "$ports_to_probe" ] || ports_to_probe="80 443"
+
+    while read -r name; do
+        [ -z "$name" ] && continue
+        for port in $ports_to_probe; do
+            for scheme in http https; do
+                if [ "$scheme" = "http" ] && [ "$port" = "443" ]; then
+                    continue
+                fi
+                if [ "$scheme" = "https" ] && [ "$port" = "80" ]; then
+                    continue
+                fi
+
+                if [ "$port" = "80" ] || [ "$port" = "443" ]; then
+                    url="$scheme://$name"
+                else
+                    url="$scheme://$name:$port"
+                fi
+
+                code="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 5 --resolve "$name:$port:$IP" "$url" || true)"
+                echo "$url $code" | tee -a enum/web/discovered-host-web-probe.txt
+
+                if [[ "$code" =~ ^(200|201|202|204|301|302|303|307|308|400|401|403|405|500|502|503)$ ]]; then
+                    append_unique_line "$url" enum/web/discovered-host-web-urls.txt
+                fi
+            done
+        done
+    done < enum/dns/discovered-hostnames.txt
+}
+
 WEB_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt \
+    /usr/share/seclists/Discovery/Web-Content/common.txt \
     /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt \
     /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
     /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt \
     /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt \
+    || true)"
+
+WEB_FILES_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt \
+    /usr/share/seclists/Discovery/Web-Content/raft-small-files.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/raft-medium-files.txt \
+    || true)"
+
+CMS_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/CMS/cms.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/CMS/cms.txt \
+    || true)"
+
+DRUPAL_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/CMS/Drupal.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/CMS/Drupal.txt \
+    /usr/share/seclists/Discovery/Web-Content/Drupal.txt \
+    || true)"
+
+WORDPRESS_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/CMS/wordpress.fuzz.txt \
+    /usr/share/seclists/Discovery/Web-Content/CMS/wp-plugins.fuzz.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/CMS/wordpress.fuzz.txt \
+    || true)"
+
+JOOMLA_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/CMS/Joomla.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/CMS/Joomla.txt \
+    || true)"
+
+API_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt \
+    /usr/share/seclists/Discovery/Web-Content/api/actions.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints.txt \
+    || true)"
+
+BACKUP_WORDLIST="$(pick_first_file \
+    /usr/share/seclists/Discovery/Web-Content/common-and-french.txt \
+    /usr/share/seclists/Discovery/Web-Content/big.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/big.txt \
     || true)"
 
 DNS_WORDLIST="$(pick_first_file \
@@ -428,13 +1084,14 @@ mkdir -p scans enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other}
 echo "[+] Starting recon for $BOX / $IP"
 echo "[+] Hostname: $HOST"
 echo "[+] Started at: $START_TIME"
+echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS"
 
 echo
 echo "=============================="
 echo "[+] 0. Tool availability check"
 echo "=============================="
 
-for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec; do
+for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
     if have "$TOOL"; then
         echo "[+] $TOOL found"
     else
@@ -453,6 +1110,14 @@ if [ -n "$WEB_WORDLIST" ]; then
 else
     echo "[!] No web directory wordlist found. Feroxbuster will be skipped."
 fi
+
+echo "[+] Optional web files wordlist: ${WEB_FILES_WORDLIST:-not found}"
+echo "[+] Optional CMS wordlist: ${CMS_WORDLIST:-not found}"
+echo "[+] Optional Drupal wordlist: ${DRUPAL_WORDLIST:-not found}"
+echo "[+] Optional WordPress wordlist: ${WORDPRESS_WORDLIST:-not found}"
+echo "[+] Optional Joomla wordlist: ${JOOMLA_WORDLIST:-not found}"
+echo "[+] Optional API wordlist: ${API_WORDLIST:-not found}"
+echo "[+] Optional backup wordlist: ${BACKUP_WORDLIST:-not found}"
 
 if [ -n "$DNS_WORDLIST" ]; then
     echo "[+] DNS wordlist: $DNS_WORDLIST"
@@ -600,8 +1265,15 @@ echo "[+] 5. Web enumeration"
 echo "=============================="
 
 if [ -s enum/web/live-web-urls.txt ]; then
+    WEB_URL_COUNT=0
     while read -r URL; do
         [ -z "$URL" ] && continue
+
+        WEB_URL_COUNT=$((WEB_URL_COUNT + 1))
+        if [ "$RECON_DEEP" != "1" ] && [ "$WEB_URL_COUNT" -gt "$MAX_WEB_URLS" ]; then
+            echo "[!] Web URL budget reached at MAX_WEB_URLS=$MAX_WEB_URLS. Enable full coverage with RECON_DEEP=1."
+            break
+        fi
 
         SAFE_URL="$(safe_name "$URL")"
         PORT="$(url_port "$URL")"
@@ -676,36 +1348,23 @@ if [ -s enum/web/live-web-urls.txt ]; then
             | truncate_lines \
             | tee "enum/web/js-interesting-$SAFE_URL.txt" || true
 
-        if have feroxbuster; then
-            if [ -n "$WEB_WORDLIST" ]; then
-                echo "[+] Running feroxbuster with $WEB_WORDLIST"
-                feroxbuster \
-                    -u "$URL" \
-                    -w "$WEB_WORDLIST" \
-                    -x php,txt,html,js,bak,old,zip,tar,gz,conf,config,json,yml,xml,log \
-                    -k \
-                    --auto-tune \
-                    --collect-words \
-                    --collect-backups \
-                    -o "enum/web/ferox-$SAFE_URL.txt" || true
-            else
-                echo "[!] Skipping feroxbuster: no web wordlist found."
-            fi
-        fi
+        TECH_PROFILE="enum/web/technology-profile-$SAFE_URL.txt"
+        WORDLIST_PLAN="enum/web/wordlists-$SAFE_URL.txt"
 
-        if have ffuf; then
-            if [ -n "$DNS_WORDLIST" ]; then
-                echo "[+] Running ffuf vhost discovery with $DNS_WORDLIST"
-                ffuf \
-                    -ac \
-                    -w "$DNS_WORDLIST" \
-                    -u "$URL/" \
-                    -H "Host: FUZZ.$HOST" \
-                    -o "enum/web/ffuf-vhosts-$SAFE_URL.json" || true
-            else
-                echo "[!] Skipping ffuf vhost discovery: no DNS wordlist found."
-            fi
-        fi
+        detect_web_technologies "$SAFE_URL" "$TECH_PROFILE"
+        build_web_wordlist_plan "$TECH_PROFILE" "$WORDLIST_PLAN"
+        WEB_EXTENSIONS="$(web_extensions_for_profile "$TECH_PROFILE")"
+
+        echo "[+] Detected web technology profile:"
+        sed 's/^/    - /' "$TECH_PROFILE" || true
+        echo "[+] Planned wordlists:"
+        sed 's/^/    - /' "$WORDLIST_PLAN" || true
+        echo "[+] Extension set: $WEB_EXTENSIONS"
+
+        run_ferox_plan "$URL" "$SAFE_URL" "$WORDLIST_PLAN" "$WEB_EXTENSIONS"
+        run_ffuf_content_plan "$URL" "$SAFE_URL" "$WORDLIST_PLAN" "$WEB_EXTENSIONS" "$TECH_PROFILE"
+        run_vhost_ffuf "$URL" "$SAFE_URL"
+        run_cms_specific_checks "$URL" "$SAFE_URL" "$TECH_PROFILE"
 
         if have nikto; then
             echo "[+] Running nikto"
@@ -751,7 +1410,7 @@ if ports_lines | grep -q '^53$'; then
 
     if have gobuster; then
         if [ -n "$DNS_WORDLIST" ]; then
-            gobuster dns \
+            run_with_timeout 900 gobuster dns \
                 -d "$HOST" \
                 -r "$IP" \
                 -w "$DNS_WORDLIST" \
@@ -760,8 +1419,36 @@ if ports_lines | grep -q '^53$'; then
             echo "[!] Skipping gobuster DNS: no DNS wordlist found."
         fi
     fi
+
+    if have ffuf; then
+        if [ -n "$DNS_WORDLIST" ]; then
+            echo "[+] Running ffuf DNS/vhost discovery against http://$IP/"
+            run_with_timeout "$FFUF_MAXTIME" ffuf \
+                -noninteractive \
+                -ac \
+                -t "$FFUF_THREADS" \
+                -rate "$FFUF_RATE" \
+                -maxtime "$FFUF_MAXTIME" \
+                -w "$DNS_WORDLIST" \
+                -u "http://$IP/" \
+                -H "Host: FUZZ.$HOST" \
+                -of json \
+                -o enum/dns/ffuf-vhosts-ip.json || true
+        else
+            echo "[!] Skipping ffuf DNS/vhost discovery: no DNS wordlist found."
+        fi
+    fi
+
+    extract_dns_hostnames
+    probe_discovered_hostnames
+
+    echo "[+] Discovered hostnames:"
+    cat enum/dns/discovered-hostnames.txt || true
+    echo "[+] Hosts additions candidate file: enum/dns/hosts-additions.txt"
 else
     echo "[-] DNS port not detected."
+    extract_dns_hostnames
+    probe_discovered_hostnames
 fi
 
 echo
@@ -1014,6 +1701,14 @@ echo "=============================="
     echo
     cat enum/web/live-web-urls.txt 2>/dev/null || true
     echo
+    echo "## Discovered DNS Hostnames"
+    echo
+    cat enum/dns/discovered-hostnames.txt 2>/dev/null || true
+    echo
+    echo "## Discovered Host Web Probe"
+    echo
+    cat enum/web/discovered-host-web-probe.txt 2>/dev/null || true
+    echo
     echo "## HTTPX Web Services"
     echo
     cat enum/web/httpx-web-services.txt 2>/dev/null || true
@@ -1025,6 +1720,24 @@ echo "=============================="
     echo "## Web Fingerprinting"
     echo
     cat enum/web/whatweb-*.txt 2>/dev/null || true
+    echo
+    echo "## Detected Web Technology Profiles"
+    echo
+    for f in enum/web/technology-profile-*.txt; do
+        [ -f "$f" ] || continue
+        echo "### $f"
+        cat "$f"
+        echo
+    done
+    echo
+    echo "## Web Wordlist Plans"
+    echo
+    for f in enum/web/wordlists-*.txt; do
+        [ -f "$f" ] || continue
+        echo "### $f"
+        cat "$f"
+        echo
+    done
     echo
     echo "## Interesting Web Headers"
     echo
@@ -1049,6 +1762,15 @@ echo "=============================="
         cat enum/web/ffuf-vhosts-*.json 2>/dev/null || true
     fi
     echo
+    echo "## FFUF Content Results"
+    if have jq; then
+        for f in enum/web/ffuf-content-*.json; do
+            [ -f "$f" ] && jq -r '.results[]? | "\(.status) \(.length) \(.words) \(.url)"' "$f" 2>/dev/null || true
+        done
+    else
+        cat enum/web/ffuf-content-*.json 2>/dev/null || true
+    fi
+    echo
     echo "## Interesting Grep Results"
     cat enum/interesting-grep.txt 2>/dev/null || true
     echo
@@ -1068,6 +1790,9 @@ echo "    scans/udp-top100.txt"
 echo "    scans/port-summary.md"
 echo "    enum/web/live-web-urls.txt"
 echo "    enum/web/curl-web-probe.txt"
+echo "    enum/web/technology-profile-*.txt"
+echo "    enum/dns/discovered-hostnames.txt"
+echo "    enum/dns/hosts-additions.txt"
 echo "    enum/interesting-grep.txt"
 echo "    enum/"
 echo "    notes.md"
@@ -1200,6 +1925,8 @@ less summary.md
 * notes.md - working notes
 * writeup.md - final report/writeup
 * recon.sh - automated first-stage recon
+* search-recon.sh - search collected recon and optionally copy matched files
+* file-hunt.sh - find readable files by name pattern and copy matches to loot
 * update-hosts.sh - update /etc/hosts for this box
 * zip-recon.sh - archive recon results
 * privesc-linux.md - local Linux privilege escalation checklist
@@ -1213,9 +1940,35 @@ less summary.md
 cat scans/open-tcp-ports.txt
 cat scans/port-summary.md
 cat enum/web/live-web-urls.txt
+cat enum/web/technology-profile-*.txt
+cat enum/dns/discovered-hostnames.txt
+cat enum/dns/hosts-additions.txt
 cat enum/web/curl-web-probe.txt
 cat enum/interesting-grep.txt
 less summary.md
+./search-recon.sh 'password|token|backup' --copy
+./file-hunt.sh 'config.php' .
+\`\`\`
+
+## Runtime Safety Knobs
+
+Default recon is conservative to avoid ffuf/ferox loops on dynamic targets.
+
+\`\`\`bash
+./recon.sh
+# Fast default recon
+./recon.sh
+
+# Disable all heavy web fuzzing
+WEB_ENUM=0 ./recon.sh
+
+# Run ferox but without extension multiplication or collect-backups
+FEROX_EXTENSIONS=0 FEROX_COLLECT=0 ./recon.sh
+
+# Deep mode when the quick pass is finished
+RECON_DEEP=1 FEROX_EXTENSIONS=1 FEROX_COLLECT=1 FFUF_CONTENT=1 ./recon.sh
+FFUF_RATE=40 FFUF_THREADS=10 FFUF_MAXTIME=180 ./recon.sh
+FFUF_VHOST=0 ./recon.sh
 \`\`\`
 
 ## Zip Recon Manually
