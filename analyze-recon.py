@@ -90,6 +90,133 @@ NEXT_STATIC_RE = re.compile(r"""(?:src|href)=["']([^"']*/_next/static/[^"']+)["'
 HTTP_HEADER_RE = re.compile(r"""^([A-Za-z0-9-]+):\s*(.+)$""", re.MULTILINE)
 
 
+# Default-port and weak-signal technology inference.
+# These rules intentionally create hypotheses, not proof. They are useful when
+# Nmap reports tcpwrapped/unknown but the port itself is high-signal.
+PORT_TECH_RULES: dict[int, dict[str, object]] = {
+    10050: {
+        "tech": "Zabbix",
+        "service": "zabbix-agent",
+        "confidence": "medium",
+        "detail": "10050/tcp is the default Zabbix agent port.",
+        "version_commands": [
+            "zabbix_get -s {target} -p 10050 -k agent.version",
+            "zabbix_get -s {target} -p 10050 -k system.hostname",
+            "zabbix_get -s {target} -p 10050 -k system.uname",
+        ],
+    },
+    10051: {
+        "tech": "Zabbix",
+        "service": "zabbix-server",
+        "confidence": "medium",
+        "detail": "10051/tcp is the default Zabbix server/trapper port.",
+        "version_commands": [
+            "nmap -sT -sV -sC -p10050,10051 --version-all {target}",
+            "for p in zabbix api_jsonrpc.php zabbix/api_jsonrpc.php zabbix/index.php; do echo ===== /$p =====; curl -s -i 'http://{target}/'$p | head -n 30; done",
+        ],
+    },
+    8111: {
+        "tech": "TeamCity",
+        "service": "teamcity",
+        "confidence": "medium",
+        "detail": "8111/tcp is commonly used by JetBrains TeamCity.",
+        "version_commands": [
+            "curl -s -i 'http://{target}:8111/' | head -n 40",
+            "curl -s 'http://{target}:8111/login.html' | grep -iE 'teamcity|version'",
+        ],
+    },
+    8080: {
+        "tech": "Java web service",
+        "service": "http-alt",
+        "confidence": "low",
+        "detail": "8080/tcp is a common alternate HTTP port used by Tomcat, Jenkins, TeamCity, Spring Boot, and other Java web services.",
+        "version_commands": [
+            "curl -s -i 'http://{target}:8080/' | head -n 40",
+            "whatweb -a 3 'http://{target}:8080/'",
+        ],
+    },
+    3000: {
+        "tech": "Node.js web service",
+        "service": "http-node",
+        "confidence": "low",
+        "detail": "3000/tcp is commonly used by Node.js/Next.js/Express/Grafana development services.",
+        "version_commands": [
+            "curl -s -i 'http://{target}:3000/' | head -n 40",
+            "whatweb -a 3 'http://{target}:3000/'",
+        ],
+    },
+    5000: {
+        "tech": "Python/Flask or Docker Registry candidate",
+        "service": "http-alt",
+        "confidence": "low",
+        "detail": "5000/tcp is commonly used by Flask/Werkzeug apps and Docker Registry.",
+        "version_commands": [
+            "curl -s -i 'http://{target}:5000/' | head -n 40",
+            "curl -s -i 'http://{target}:5000/v2/' | head -n 40",
+        ],
+    },
+    6379: {
+        "tech": "Redis",
+        "service": "redis",
+        "confidence": "medium",
+        "detail": "6379/tcp is the default Redis port.",
+        "version_commands": [
+            "redis-cli -h {target} -p 6379 INFO server",
+        ],
+    },
+    9200: {
+        "tech": "Elasticsearch",
+        "service": "elasticsearch",
+        "confidence": "medium",
+        "detail": "9200/tcp is the default Elasticsearch HTTP API port.",
+        "version_commands": [
+            "curl -s 'http://{target}:9200/' | jq .",
+        ],
+    },
+    27017: {
+        "tech": "MongoDB",
+        "service": "mongodb",
+        "confidence": "medium",
+        "detail": "27017/tcp is the default MongoDB port.",
+        "version_commands": [
+            "mongosh --host {target} --eval 'db.version()'",
+        ],
+    },
+}
+
+# Local hypothesis rules for well-known CVEs that are easy to miss when only a
+# port or weak fingerprint is present. These are not vulnerability claims; they
+# create research candidates with explicit manual validation steps.
+OFFLINE_CVE_RULES: list[dict[str, object]] = [
+    {
+        "id": "CVE-2024-22120",
+        "product": "Zabbix",
+        "severity": "HIGH/CRITICAL candidate",
+        "confidence": "medium",
+        "impact_keywords": ["remote code execution", "rce", "sql injection", "command execution"],
+        "version_ranges": ["6.0.0-6.0.27", "6.4.0-6.4.12", "7.0.0alpha1-7.0.0beta1"],
+        "hints": ["zabbix", "10050", "10051", "api_jsonrpc.php", "/zabbix"],
+        "title": "Zabbix Server audit log clientip SQL injection / RCE-chain research candidate",
+        "summary": "Possible Zabbix exposure was detected. Research CVE-2024-22120 after confirming Zabbix Server/frontend/API access and version. Do not treat this as confirmed vulnerable without version and access validation.",
+        "references": [
+            "https://support.zabbix.com/browse/ZBX-24505",
+            "https://nvd.nist.gov/vuln/detail/CVE-2024-22120",
+        ],
+        "verification": [
+            "Locate the Zabbix frontend or API endpoint, commonly /zabbix/ or /api_jsonrpc.php.",
+            "Identify the Zabbix Server version from the UI, API, package files, or agent/server banners.",
+            "Check whether the confirmed version falls in 6.0.0-6.0.27, 6.4.0-6.4.12, or 7.0.0 alpha/beta affected ranges.",
+            "Validate exploit prerequisites before attempting any exploit path.",
+        ],
+    },
+]
+
+ZABBIX_VERSION_RE = re.compile(
+    r"""\bZabbix(?:\s+(?:Server|Agent|Frontend))?[/'\s:-]*(\d+\.\d+(?:\.\d+)?(?:alpha\d+|beta\d+|rc\d+)?[0-9A-Za-z.\-+]*)""",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class Port:
     number: int
@@ -391,6 +518,145 @@ def add_port(data: ReconData, num: int, service: str, version: str = "", proto: 
         existing.version = version
     if proto and not existing.proto:
         existing.proto = proto
+
+
+def service_text(data: ReconData) -> str:
+    parts: list[str] = []
+    for port in sorted(data.ports.values(), key=lambda p: (p.proto, p.number)):
+        parts.append(f"{port.number}/{port.proto} {port.service} {port.version}")
+    parts.extend(sorted(data.technologies))
+    parts.extend(sorted(data.endpoints))
+    parts.extend(sorted(data.web_urls))
+    return "\n".join(parts)
+
+
+def has_technology(data: ReconData, name: str) -> bool:
+    needle = name.lower()
+    return needle in service_text(data).lower()
+
+
+def infer_tech_from_ports(data: ReconData) -> None:
+    """Infer possible products from default ports when banners are weak.
+
+    This is deliberately hypothesis-level. It helps the report say
+    "possible Zabbix" from 10050/10051 even when Nmap reports tcpwrapped.
+    """
+    for port_no, rule in PORT_TECH_RULES.items():
+        port = data.ports.get(port_no)
+        if not port:
+            continue
+
+        tech = str(rule.get("tech", "")).strip()
+        service = str(rule.get("service", "")).strip()
+        detail = str(rule.get("detail", "")).strip()
+
+        if tech:
+            data.technologies.add(f"{tech} (port {port_no} heuristic)")
+        if service and (not port.service or port.service.lower() in {"unknown", "tcpwrapped", "ppp?"}):
+            port.service = service
+        if detail and not port.version:
+            port.version = detail
+
+
+def detect_product_versions_from_text(data: ReconData, text: str, rel: str = "") -> None:
+    """Extract non-package product versions from banners, HTML, logs, and notes."""
+    low_rel = rel.lower()
+
+    for match in ZABBIX_VERSION_RE.finditer(text):
+        version = match.group(1).strip().rstrip(".,;:)]}")
+        if version:
+            data.technologies.add(f"Zabbix {version}")
+            add_package(data, "generic", "zabbix", version)
+
+    # Zabbix frontend/API fingerprints often do not expose a version.
+    if re.search(r"\bZabbix\b|api_jsonrpc\.php|/zabbix/", text, re.IGNORECASE):
+        if not ("nikto" in low_rel and "zabbix" not in text.lower()):
+            data.technologies.add("Zabbix")
+            add_package(data, "generic", "zabbix", "")
+
+
+def version_in_range(version: str, affected_range: str) -> Optional[bool]:
+    """Best-effort inclusive range check for normal x.y.z versions.
+
+    Returns None when the version/range uses alpha/beta/rc labels or cannot be
+    compared safely.
+    """
+    if not version or "-" not in affected_range:
+        return None
+    start, end = affected_range.split("-", 1)
+    if re.search(r"(?i)(alpha|beta|rc)", version + start + end):
+        # Pre-release ordering is easy to get subtly wrong. Keep it manual.
+        return None
+    try:
+        return version_tuple(start) <= version_tuple(version) <= version_tuple(end)
+    except Exception:
+        return None
+
+
+def cve_rule_matches(data: ReconData, rule: dict[str, object]) -> tuple[bool, str, str]:
+    """Return match status, confidence, and reason for a local CVE hint rule."""
+    product = str(rule.get("product", "")).lower()
+    haystack = service_text(data).lower()
+    hints = [str(h).lower() for h in rule.get("hints", [])]
+    version_ranges = [str(r) for r in rule.get("version_ranges", [])]
+
+    product_seen = product and product in haystack
+    hint_hits = [h for h in hints if h in haystack]
+
+    detected_versions = []
+    for key, versions in data.package_versions.items():
+        if product and product in key.lower():
+            detected_versions.extend(v for v in versions if v)
+    for tech in data.technologies:
+        if product and product in tech.lower():
+            detected_versions.extend(re.findall(r"\b\d+\.\d+(?:\.\d+)?[0-9A-Za-z.\-+]*", tech))
+
+    for version in sorted(set(detected_versions)):
+        checks = [version_in_range(version, r) for r in version_ranges]
+        if True in checks:
+            return True, "high", f"{rule.get('product')} version {version} falls in affected range"
+        if checks and all(c is False for c in checks):
+            return False, "low", f"{rule.get('product')} version {version} appears outside configured affected ranges"
+
+    if product_seen and hint_hits:
+        return True, str(rule.get("confidence", "medium")), "product and local hints matched; version unknown"
+    if len(hint_hits) >= 2:
+        return True, "medium", "multiple local hints matched; product/version need confirmation"
+    if hint_hits:
+        return True, "low", "single weak hint matched; manual confirmation required"
+
+    return False, "low", "no local evidence"
+
+
+def offline_cve_hints(data: ReconData) -> list[VulnMatch]:
+    matches: list[VulnMatch] = []
+    for rule in OFFLINE_CVE_RULES:
+        matched, confidence, reason = cve_rule_matches(data, rule)
+        if not matched:
+            continue
+
+        version = ""
+        product = str(rule.get("product", ""))
+        for key, versions in sorted(data.package_versions.items()):
+            if product.lower() in key.lower():
+                version = next((v for v in sorted(versions) if v), "")
+                break
+
+        matches.append(score_vuln_match(data, VulnMatch(
+            source="LOCAL-RULE",
+            vuln_id=str(rule.get("id", "unknown")),
+            title=str(rule.get("title", "")),
+            severity=str(rule.get("severity", "unknown")),
+            package=product,
+            ecosystem="heuristic",
+            version=version or "version unknown",
+            confidence=confidence,
+            summary=str(rule.get("summary", "")),
+            references=[str(r) for r in rule.get("references", [])],
+            aliases=[str(rule.get("id", ""))] if rule.get("id") else [],
+            reason=reason,
+        )))
+    return matches
 
 
 def parse_markdown_port_table_line(data: ReconData, line: str) -> None:
@@ -878,6 +1144,7 @@ def parse_web(data: ReconData) -> None:
         detect_nextjs_from_text(data, text, rel)
         collect_nikto_noise(data, text)
         detect_tech_from_text(data, text, rel)
+        detect_product_versions_from_text(data, text, rel)
 
 
 def normalize_web_ports(data: ReconData) -> None:
@@ -1063,6 +1330,17 @@ def parse_package_files(data: ReconData) -> None:
         # browser bundle. Record it without a version so NVD keyword search can
         # still consider the technology, while OSV exact matching will skip it.
         add_package(data, "npm", "react-server-dom-webpack", "")
+
+    # Generic service/product candidates inferred from ports or banners.
+    # They are useful for NVD keyword research and local CVE hint rules.
+    if has_technology(data, "zabbix"):
+        add_package(data, "generic", "zabbix", "")
+    if has_technology(data, "teamcity"):
+        add_package(data, "generic", "teamcity", "")
+    if has_technology(data, "jenkins"):
+        add_package(data, "generic", "jenkins", "")
+    if has_technology(data, "grafana"):
+        add_package(data, "generic", "grafana", "")
 
 
 def cache_load(path: Path) -> dict:
@@ -1259,6 +1537,14 @@ def score_vuln_match(data: ReconData, m: VulnMatch) -> VulnMatch:
         score += 15
         reasons.append("matches detected Next.js/React stack")
 
+    if has_technology(data, "zabbix") and "zabbix" in text:
+        score += 20
+        reasons.append("matches detected Zabbix candidate")
+
+    if m.source == "LOCAL-RULE":
+        score += 20
+        reasons.append("local port/service CVE rule matched")
+
     if data.nextjs_app_router and ("app router" in text or "server components" in text or "rsc" in text):
         score += 20
         reasons.append("App Router/RSC condition is locally confirmed")
@@ -1360,8 +1646,13 @@ def nvd_keyword_terms(data: ReconData) -> list[str]:
                 terms.append(f"{name} {version}".strip())
     for tech in sorted(data.technologies):
         low = tech.lower()
-        if any(x in low for x in ("next.js", "react ", "openssh", "grafana", "jenkins", "tomcat", "jetty", "wordpress", "drupal")):
+        if any(x in low for x in ("next.js", "react ", "openssh", "grafana", "jenkins", "teamcity", "tomcat", "jetty", "wordpress", "drupal", "zabbix", "redis", "elasticsearch", "mongodb")):
             terms.append(tech)
+    for key, versions in sorted(data.package_versions.items()):
+        ecosystem, name = key.split(":", 1)
+        if ecosystem.lower() == "generic" and name in {"zabbix", "teamcity", "jenkins", "grafana"}:
+            for version in sorted(versions):
+                terms.append(f"{name} {version}".strip())
     # Strong fallback terms for the React/RSC fingerprint without hardcoding a CVE.
     if looks_like_nextjs(data) and (data.nextjs_app_router or data.rsc_indicators):
         terms.append("React Server Components Next.js App Router remote code execution")
@@ -1511,10 +1802,11 @@ def dedupe_vuln_matches(matches: list[VulnMatch]) -> list[VulnMatch]:
 
 def run_vulnerability_intel(data: ReconData, online: bool, cache_path: Path, timeout: int, nvd_api_key: str, max_results: int) -> None:
     parse_package_files(data)
+    matches: list[VulnMatch] = offline_cve_hints(data)
     if not online:
+        data.vuln_matches = dedupe_vuln_matches(matches)[:80]
         return
     cache = cache_load(cache_path)
-    matches: list[VulnMatch] = []
     try:
         matches.extend(run_osv_lookup(data, cache, timeout=timeout))
     except Exception as exc:
@@ -1538,6 +1830,7 @@ def load_recon(root: Path, source: Path) -> ReconData:
 
     parse_target_env(data)
     parse_ports(data)
+    infer_tech_from_ports(data)
     parse_web(data)
     normalize_web_ports(data)
     parse_smb(data)
@@ -1625,6 +1918,8 @@ def detect_profile(data: ReconData) -> list[str]:
         profiles.append("MSSQL exposed")
     if 9389 in ports or ".net message framing" in tech:
         profiles.append(".NET/ADWS-style service exposed")
+    if "zabbix" in tech or 10050 in ports or 10051 in ports:
+        profiles.append("Monitoring stack / Zabbix candidate")
 
     return profiles
 
@@ -1722,6 +2017,36 @@ def build_findings(data: ReconData) -> list[Finding]:
             commands=[
                 "Review the Vulnerability Intelligence section in this report.",
                 "Prefer exact OSV package/version matches over broad NVD keyword hits.",
+            ],
+        ))
+
+    if has_technology(data, "zabbix"):
+        zabbix_ports = [p for p in (10050, 10051) if p in ports]
+        zabbix_versions = sorted(
+            v for key, versions in data.package_versions.items()
+            if "zabbix" in key.lower()
+            for v in versions
+            if v
+        )
+        evidence = []
+        if zabbix_ports:
+            evidence.append("Zabbix default port(s): " + ", ".join(str(p) for p in zabbix_ports))
+        if zabbix_versions:
+            evidence.append("Zabbix version(s): " + ", ".join(zabbix_versions))
+        evidence.extend(t for t in sorted(data.technologies) if "zabbix" in t.lower())
+
+        findings.append(Finding(
+            "Possible Zabbix exposure / CVE research candidate",
+            "Zabbix was inferred from default ports, banners, paths, or text fingerprints. This is enough to trigger Zabbix-specific enumeration and CVE research, but not enough to claim vulnerability without version and access validation.",
+            "high" if zabbix_versions else "medium",
+            evidence=evidence or ["Zabbix technology candidate detected"],
+            commands=[
+                f"nmap -sT -sV -sC -p10050,10051 --version-all {target_name(data)}",
+                f"for p in zabbix api_jsonrpc.php zabbix/api_jsonrpc.php zabbix/index.php; do echo ===== /$p =====; curl -s -i '{base_url}/'$p | head -n 40; done",
+                f"zabbix_get -s {target_ip(data)} -p 10050 -k agent.version",
+                f"zabbix_get -s {target_ip(data)} -p 10050 -k system.hostname",
+                "grep -RniE 'zabbix|api_jsonrpc|10050|10051|CVE-2024-22120' .",
+                "Search terms: Zabbix CVE-2024-22120 affected versions exploit requirements",
             ],
         ))
 
@@ -1842,6 +2167,25 @@ def build_findings(data: ReconData) -> list[Finding]:
             ],
         ))
 
+    heuristic_ports = []
+    for port_no, rule in PORT_TECH_RULES.items():
+        if port_no in ports:
+            heuristic_ports.append(f"{port_no}/tcp -> {rule.get('tech')} ({rule.get('confidence', 'low')} confidence)")
+    if heuristic_ports:
+        commands = []
+        for port_no, rule in PORT_TECH_RULES.items():
+            if port_no not in ports:
+                continue
+            for command in rule.get("version_commands", []):
+                commands.append(str(command).format(target=target_name(data)))
+        findings.append(Finding(
+            "Default-port technology candidates",
+            "One or more open ports map to well-known products. Use these as research hypotheses when service banners are weak, tcpwrapped, or generic.",
+            "medium",
+            evidence=heuristic_ports[:12],
+            commands=commands[:16] or ["Review nmap -sV output and service-specific probes for default-port technologies."],
+        ))
+
     if data.web_urls or data.endpoints or any(p in ports for p in (80, 443, 3000, 5000, 8000, 8080, 8443, 9000, 9090, 10000)):
         findings.append(Finding(
             "Web application artifacts found",
@@ -1908,6 +2252,15 @@ def cve_search_suggestions(data: ReconData) -> list[str]:
             suggestions.append(f"{tech} linked server xp_dirtree coercion credentials")
         elif "openssh" in low:
             suggestions.append(f"{tech} privilege escalation CVE check version distro backports")
+        elif "zabbix" in low:
+            suggestions.append("Zabbix CVE-2024-22120 affected versions exploit requirements api_jsonrpc clientip")
+            suggestions.append("Zabbix 10050 10051 agent server version enumeration")
+        elif "teamcity" in low:
+            suggestions.append(f"{tech} authentication bypass RCE CVE version check")
+        elif "grafana" in low:
+            suggestions.append(f"{tech} CVE version check default credentials plugins")
+        elif "jenkins" in low:
+            suggestions.append(f"{tech} RCE script console CVE version check")
         elif ".net message framing" in low:
             suggestions.append(".NET Message Framing WCF localhost service command injection")
         elif "active directory" in low:
