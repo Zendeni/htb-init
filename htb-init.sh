@@ -50,6 +50,8 @@ cat > .target.env <<EOF
 BOX="$BOX"
 IP="$IP"
 HOST="$HOST"
+# Extra vhost base domains discovered from redirects are stored during recon in:
+#   enum/dns/vhost-base-domains.txt
 BASE_DIR="$BASE_DIR"
 EOF
 
@@ -63,25 +65,48 @@ cd "$SCRIPT_DIR"
 source ./.target.env
 
 tmpfile="$(mktemp)"
-trap 'rm -f "$tmpfile"' EXIT
+hostsfile="$(mktemp)"
+trap 'rm -f "$tmpfile" "$hostsfile"' EXIT
 
 echo "[+] Updating /etc/hosts for $HOST"
 
-awk -v host="$HOST" '
+# Always include the primary HTB hostname. If recon has already discovered
+# redirect/vhost names such as watcher.vl or zabbix.watcher.vl, include those too.
+{
+    echo "$HOST"
+    cat enum/dns/vhost-base-domains.txt 2>/dev/null || true
+    cat enum/dns/discovered-hostnames.txt 2>/dev/null || true
+    awk '{for (i=2; i<=NF; i++) print $i}' enum/dns/hosts-additions.txt 2>/dev/null || true
+} | sed '/^[[:space:]]*$/d' | tr '[:upper:]' '[:lower:]' | sort -u > "$hostsfile"
+
+echo "[+] Hostnames to map:"
+sed 's/^/    - /' "$hostsfile"
+
+awk -v hosts_file="$hostsfile" '
+BEGIN {
+    while ((getline h < hosts_file) > 0) { remove[h] = 1 }
+}
 {
     keep = 1
     for (i = 2; i <= NF; i++) {
-        if ($i == host) keep = 0
+        if ($i in remove) keep = 0
     }
     if (keep) print
 }
 ' /etc/hosts > "$tmpfile"
 
-echo "$IP $HOST" >> "$tmpfile"
+if [ -s "$hostsfile" ]; then
+    printf "%s " "$IP" >> "$tmpfile"
+    tr '\n' ' ' < "$hostsfile" >> "$tmpfile"
+    printf "\n" >> "$tmpfile"
+fi
+
 sudo cp "$tmpfile" /etc/hosts
 
-echo "[+] Current hosts entry:"
-getent hosts "$HOST" || true
+echo "[+] Current hosts entries:"
+while read -r name; do
+    [ -n "$name" ] && getent hosts "$name" || true
+done < "$hostsfile"
 EOF
 
 chmod +x update-hosts.sh
@@ -508,6 +533,66 @@ url_scheme() {
     echo "${1%%://*}"
 }
 
+url_host() {
+    local url="$1"
+    local remainder hostport
+
+    remainder="${url#*://}"
+    hostport="${remainder%%/*}"
+    echo "${hostport%%:*}"
+}
+
+is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_hostname_candidate() {
+    local name="$1"
+
+    [ -n "$name" ] || return 1
+    is_ipv4 "$name" && return 1
+    [[ "$name" == *.* ]] || return 1
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    return 0
+}
+
+record_vhost_base_domain() {
+    local name="$1"
+
+    name="$(printf '%s' "$name" | sed 's/[[:space:]]//g; s/:$//; s/^\.//; s/\.$//' | tr '[:upper:]' '[:lower:]')"
+    is_hostname_candidate "$name" || return 0
+    mkdir -p enum/dns
+    append_unique_line "$name" enum/dns/vhost-base-domains.txt
+}
+
+collect_vhost_base_domains() {
+    local url host location host_from_location
+
+    mkdir -p enum/dns
+    touch enum/dns/vhost-base-domains.txt
+    record_vhost_base_domain "$HOST"
+
+    # If the direct URL hostname is already a real hostname, include it.
+    for url in "$@"; do
+        [ -z "$url" ] && continue
+        host="$(url_host "$url")"
+        record_vhost_base_domain "$host"
+    done
+
+    # Critical HTB/VL case: port 80 often redirects from the IP to the real vhost
+    # namespace, e.g. Location: http://watcher.vl/. Fuzz both FUZZ.$HOST and
+    # FUZZ.<redirect-host>, otherwise subdomains like zabbix.watcher.vl are missed.
+    { grep -RhoEi '^location:[[:space:]]*https?://[^/[:space:]]+' enum/web/headers-*.txt enum/web/*headers*.txt 2>/dev/null || true; } | while read -r location; do
+        host_from_location="$(printf '%s' "$location" | sed -E 's/^location:[[:space:]]*https?:\/\///I; s#/.*##; s/:.*$//')"
+        record_vhost_base_domain "$host_from_location"
+    done
+
+    { grep -RhoE 'https?://[A-Za-z0-9._-]+' enum/web enum/dns 2>/dev/null || true; } | while read -r location; do
+        host_from_location="$(url_host "$location")"
+        record_vhost_base_domain "$host_from_location"
+    done
+}
+
 safe_name() {
     echo "$1" | sed 's#[/:?&=.]#_#g'
 }
@@ -872,7 +957,7 @@ run_ffuf_content_plan() {
 run_vhost_ffuf() {
     local url="$1"
     local safe_url="$2"
-    local scheme port lock_file
+    local scheme port lock_file base_domain safe_base output_file
 
     if [ "$WEB_ENUM" != "1" ]; then
         echo "[!] Skipping ffuf vhost discovery because WEB_ENUM=$WEB_ENUM."
@@ -899,26 +984,48 @@ run_vhost_ffuf() {
 
     scheme="$(url_scheme "$url")"
     port="$(url_port "$url")"
-    lock_file="enum/web/.ffuf-vhost-$scheme-$port.done"
 
-    if [ -f "$lock_file" ]; then
-        echo "[!] Skipping duplicate ffuf vhost scan for $scheme/$port."
+    collect_vhost_base_domains "$url"
+
+    if [ ! -s enum/dns/vhost-base-domains.txt ]; then
+        echo "[!] No vhost base domains available for ffuf."
         return 0
     fi
-    touch "$lock_file"
 
-    echo "[+] Running bounded ffuf vhost discovery with $DNS_WORDLIST"
-    run_with_timeout "$FFUF_MAXTIME" ffuf \
-        -noninteractive \
-        -ac \
-        -t "$FFUF_THREADS" \
-        -rate "$FFUF_RATE" \
-        -maxtime "$FFUF_MAXTIME" \
-        -w "$DNS_WORDLIST" \
-        -u "$url/" \
-        -H "Host: FUZZ.$HOST" \
-        -of json \
-        -o "enum/web/ffuf-vhosts-$safe_url.json" || true
+    while read -r base_domain; do
+        [ -n "$base_domain" ] || continue
+        is_hostname_candidate "$base_domain" || continue
+
+        safe_base="$(safe_name "$base_domain")"
+
+        for vhost_wordlist in "$PRIORITY_VHOST_WORDLIST" "$DNS_WORDLIST"; do
+            [ -n "$vhost_wordlist" ] || continue
+            [ -f "$vhost_wordlist" ] || continue
+
+            label="$(safe_name "$(basename "$vhost_wordlist")")"
+            lock_file="enum/web/.ffuf-vhost-$scheme-$port-$safe_base-$label.done"
+            output_file="enum/web/ffuf-vhosts-$safe_url-$safe_base-$label.json"
+
+            if [ -f "$lock_file" ]; then
+                echo "[!] Skipping duplicate ffuf vhost scan for $scheme/$port base $base_domain wordlist $label."
+                continue
+            fi
+            touch "$lock_file"
+
+            echo "[+] Running bounded ffuf vhost discovery with $vhost_wordlist against base domain: $base_domain"
+            run_with_timeout "$FFUF_MAXTIME" ffuf \
+                -noninteractive \
+                -ac \
+                -t "$FFUF_THREADS" \
+                -rate "$FFUF_RATE" \
+                -maxtime "$FFUF_MAXTIME" \
+                -w "$vhost_wordlist" \
+                -u "$url/" \
+                -H "Host: FUZZ.$base_domain" \
+                -of json \
+                -o "$output_file" || true
+        done
+    done < enum/dns/vhost-base-domains.txt
 }
 
 run_cms_specific_checks() {
@@ -960,18 +1067,53 @@ run_cms_specific_checks() {
 }
 
 extract_dns_hostnames() {
-    local host_regex
+    local domain domain_regex tmp raw_hosts
 
-    host_regex="$(printf '%s' "$HOST" | sed 's/[][\\.^$*+?{}|()]/\\&/g')"
+    mkdir -p enum/dns
+    tmp="$(mktemp)"
+    raw_hosts="$(mktemp)"
+    trap 'rm -f "$tmp" "$raw_hosts"' RETURN
+
+    collect_vhost_base_domains
+
     : > enum/dns/discovered-hostnames.txt
+    : > enum/dns/discovered-subdomains.txt
+    : > enum/dns/hosts-additions.txt
 
-    grep -RhoE "([A-Za-z0-9_-]+\.)*$host_regex" enum/dns enum/web 2>/dev/null \
-        | sed 's/^[*.]*//' \
+    # 1) Extract hostnames ending in every known base domain, not only $HOST.
+    while read -r domain; do
+        [ -n "$domain" ] || continue
+        is_hostname_candidate "$domain" || continue
+
+        domain_regex="$(printf '%s' "$domain" | sed 's/[][\.^$*+?{}|()]/\\&/g')"
+        grep -RhoE "([A-Za-z0-9_-]+\.)*$domain_regex" enum/dns enum/web 2>/dev/null >> "$raw_hosts" || true
+        echo "$domain" >> "$raw_hosts"
+    done < enum/dns/vhost-base-domains.txt
+
+    # 2) Parse ffuf JSON directly because .host is the most reliable source.
+    if have jq; then
+        for f in enum/web/ffuf-vhosts-*.json enum/dns/ffuf-vhosts-*.json; do
+            [ -f "$f" ] || continue
+            jq -r '.results[]? | .host // empty' "$f" 2>/dev/null >> "$raw_hosts" || true
+        done
+    else
+        grep -RhoE '"host"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]+"' enum/web enum/dns 2>/dev/null \
+            | sed -E 's/.*"host"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' >> "$raw_hosts" || true
+    fi
+
+    sed 's/^[*.]*//; s/[[:space:]]//g; s/:$//; s/\.$//' "$raw_hosts" \
         | tr '[:upper:]' '[:lower:]' \
-        | sort -u \
-        > enum/dns/discovered-hostnames.txt || true
+        | grep -E '^[a-z0-9._-]+\.[a-z0-9._-]+$' \
+        | grep -Ev '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+        | sort -u > enum/dns/discovered-hostnames.txt || true
 
-    grep -Fxv "$HOST" enum/dns/discovered-hostnames.txt > enum/dns/discovered-subdomains.txt || true
+    cp enum/dns/discovered-hostnames.txt "$tmp"
+    while read -r domain; do
+        [ -n "$domain" ] || continue
+        grep -Fxv "$domain" "$tmp" > "$tmp.filtered" || true
+        mv "$tmp.filtered" "$tmp"
+    done < enum/dns/vhost-base-domains.txt
+    cp "$tmp" enum/dns/discovered-subdomains.txt
 
     while read -r name; do
         [ -n "$name" ] && echo "$IP $name"
@@ -1074,12 +1216,66 @@ DNS_WORDLIST="$(pick_first_file \
     /usr/share/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt \
     || true)"
 
+PRIORITY_VHOST_WORDLIST="enum/dns/priority-vhosts.txt"
+mkdir -p enum/dns
+cat > "$PRIORITY_VHOST_WORDLIST" <<'PRIORITYVHOSTS'
+www
+admin
+administrator
+adm
+app
+apps
+api
+api-dev
+dev
+devel
+development
+test
+testing
+stage
+staging
+beta
+portal
+login
+auth
+sso
+dashboard
+console
+internal
+intranet
+monitor
+monitoring
+zabbix
+grafana
+prometheus
+kibana
+elastic
+jenkins
+teamcity
+ci
+build
+git
+gitlab
+gitea
+repo
+repos
+status
+helpdesk
+support
+backup
+backups
+old
+legacy
+PRIORITYVHOSTS
+
 SNMP_WORDLIST="$(pick_first_file \
     /usr/share/seclists/Discovery/SNMP/snmp.txt \
     /usr/share/wordlists/seclists/Discovery/SNMP/snmp.txt \
     || true)"
 
 mkdir -p scans enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other}
+: > enum/dns/vhost-base-domains.txt
+append_unique_line "$HOST" enum/dns/vhost-base-domains.txt
 
 echo "[+] Starting recon for $BOX / $IP"
 echo "[+] Hostname: $HOST"
@@ -1306,6 +1502,10 @@ if [ -s enum/web/live-web-urls.txt ]; then
                 curl -k -s -i -H "Host: $HOST" "$URL/$WEBPATH" -o "enum/web/${SAFE_PATH}-host-$SAFE_URL.txt" || true
             done
         fi
+
+        collect_vhost_base_domains "$URL" "$HOST_URL"
+        echo "[+] Vhost base domains currently known:"
+        sed 's/^/    - /' enum/dns/vhost-base-domains.txt 2>/dev/null || true
 
         echo "[+] Extracting JavaScript references"
 
@@ -1701,6 +1901,10 @@ echo "=============================="
     echo
     cat enum/web/live-web-urls.txt 2>/dev/null || true
     echo
+    echo "## Vhost Base Domains"
+    echo
+    cat enum/dns/vhost-base-domains.txt 2>/dev/null || true
+    echo
     echo "## Discovered DNS Hostnames"
     echo
     cat enum/dns/discovered-hostnames.txt 2>/dev/null || true
@@ -1941,6 +2145,7 @@ cat scans/open-tcp-ports.txt
 cat scans/port-summary.md
 cat enum/web/live-web-urls.txt
 cat enum/web/technology-profile-*.txt
+cat enum/dns/vhost-base-domains.txt
 cat enum/dns/discovered-hostnames.txt
 cat enum/dns/hosts-additions.txt
 cat enum/web/curl-web-probe.txt
