@@ -1,849 +1,139 @@
-# htb-init
+# htb-init + ScopeLens
 
-`htb-init` is a Bash-based Hack The Box workspace initializer, first-stage recon automation helper, recon archiver, and recon-analysis workflow.
+**Prepare a workspace, inspect the evidence, and open a readable report.**
 
-It creates a clean workspace for a new HTB machine, generates target configuration, helper scripts, starter notes, a writeup template, a Linux privilege escalation checklist, automated recon tooling, and a ZIP archive helper.
+[htb-init](https://github.com/Zendeni/htb-init) creates HTB workspaces. [ScopeLens](https://github.com/Zendeni/scopelens) provides their shared offline analysis workflow: artifact coverage, evidence-backed findings, searchable HTML, JSON, Markdown, and comparisons between reviews.
 
-The repository also includes `analyze-recon.py`, a standalone recon analysis helper that reviews collected recon output and generates prioritized next-step suggestions. It works offline by default and can optionally enrich findings with online vulnerability intelligence from OSV and NVD.
+The integration uses ScopeLens **0.2.0 or newer** and Python **3.10 or newer**. The initializer and generated shell helpers require Bash; ScopeLens itself also works on Windows and macOS. Preparing, inspecting, and reviewing a workspace reads local evidence without contacting targets or executing collected scripts.
 
-The workflow is intended for authorized Hack The Box labs.
+## Install both tools together
 
----
-
-## Features
-
-- Creates a structured workspace under `/home/zendeni/htb_labs/<box>/`
-- Generates a machine-local `.target.env`
-- Generates an `/etc/hosts` update helper
-- Generates an automated `recon.sh` script
-- Generates a recon ZIP archive helper
-- Generates starter `notes.md` and `writeup.md`
-- Generates a Linux privilege escalation checklist
-- Runs service-aware enumeration based on discovered ports
-- Performs TCP and UDP discovery
-- Performs web discovery with ProjectDiscovery `httpx` when available
-- Falls back to curl-based HTTP/HTTPS probing when ProjectDiscovery `httpx` is unavailable
-- Uses faster timeout-safe curl probing for Windows/AD-style targets
-- Avoids wasting time on obvious non-web AD ports during web probing
-- Runs service-specific enumeration for DNS, SMB, FTP, SSH, NFS/RPC, SNMP, LDAP, Kerberos, and WinRM
-- Wraps noisy/hanging SMB tools such as `enum4linux` with a timeout
-- Saves console output and recon summaries
-- Automatically creates a ZIP archive after recon
-- Avoids overwriting existing `notes.md` and `writeup.md`
-- Provides optional recon interpretation through `analyze-recon.py`
-- Supports optional online vulnerability intelligence lookup through OSV and NVD
-- Supports optional NVD API key usage
-- Supports analysis of both live workspace folders and archived recon ZIP files
-
----
-
-## Repository Structure
-
-```text
-htb-init/
-├── README.md
-├── htb-init.sh
-└── analyze-recon.py
-```
-
----
-
-## Installation
-
-Clone the repository:
+Use sibling checkouts and one virtual environment:
 
 ```bash
 git clone https://github.com/Zendeni/htb-init.git
-cd htb-init
+git clone https://github.com/Zendeni/scopelens.git
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install ./scopelens
+scopelens --version
+scopelens doctor
 ```
 
-Make the scripts executable:
+Activate this environment in each new terminal before using the analysis commands. The shell entrypoints use `python3`; set `HTB_PYTHON` to another Python executable if needed. Installing ScopeLens requires access to its source and Python build dependencies; the installed analyzer makes no network requests.
 
-```bash
-chmod +x htb-init.sh
-chmod +x analyze-recon.py
-```
+## Review an existing workspace
 
-Install `htb-init` as a system command:
-
-```bash
-sudo cp htb-init.sh /usr/local/bin/htb-init
-sudo chmod +x /usr/local/bin/htb-init
-```
-
-Optional: install `analyze-recon.py` into your HTB tools folder:
+Prepare the workspace once, including workspaces created by earlier htb-init versions:
 
 ```bash
-mkdir -p /home/zendeni/tools/htb
-cp analyze-recon.py /home/zendeni/tools/htb/analyze-recon.py
-chmod +x /home/zendeni/tools/htb/analyze-recon.py
+scopelens prepare /path/to/htb-workspace
+cd /path/to/htb-workspace
+./inspect.sh
+./analyze.sh
 ```
 
-Confirm installation:
+Open the `report.html` path printed by the review command in your browser. Each run gets its own directory under `reports/`, containing `report.html`, `report.json`, and `report.md`. Search or filter the HTML findings, expand their evidence, and check import coverage before drawing conclusions.
 
-```bash
-which htb-init
-head -n 1 "$(which htb-init)"
-bash -n "$(which htb-init)" && echo "syntax OK"
-```
-
-Expected:
-
-```text
-/usr/local/bin/htb-init
-#!/usr/bin/env bash
-syntax OK
-```
-
-Confirm the analyzer:
+After adding or updating your collected artifacts:
 
 ```bash
-/home/zendeni/tools/htb/analyze-recon.py -h
+./analyze.sh --baseline latest
 ```
 
----
+This compares against the latest eligible saved report. Run an initial review first: `--baseline latest` fails if there is no previous report. You can also pass an explicit baseline with `--baseline /path/to/report.json`.
 
-## Usage
+The equivalent commands work without Bash:
 
-```bash
-htb-init <box-name> <target-ip>
+```console
+scopelens inspect /path/to/htb-workspace
+scopelens review /path/to/htb-workspace
+scopelens review /path/to/htb-workspace --baseline latest
 ```
 
-Example:
-
-```bash
-htb-init principal 10.129.244.220
-```
-
-Use the short box name only. Do **not** include `.htb`.
-
-Correct:
+You can also use the htb-init entrypoint:
 
 ```bash
-htb-init principal 10.129.244.220
+bash htb-init/htb-init.sh --prepare /path/to/htb-workspace
+bash htb-init/htb-init.sh --inspect /path/to/htb-workspace --json
+bash htb-init/htb-init.sh --review /path/to/htb-workspace
 ```
 
-Wrong:
+These commands use the installed ScopeLens package.
 
-```bash
-htb-init principal.htb 10.129.244.220
-```
+## Create a new workspace
 
-This creates:
-
-```text
-/home/zendeni/htb_labs/principal
-```
-
-and configures:
-
-```text
-BOX="principal"
-IP="10.129.244.220"
-HOST="principal.htb"
-BASE_DIR="/home/zendeni/htb_labs/principal"
-```
-
----
-
-## Requirements
-
-The script expects a Linux/Kali-style environment.
-
-Required:
+From the directory containing both checkouts, with the environment active:
 
 ```bash
-bash
-sudo
-awk
-getent
-nmap
-timeout
-zip
-python3
+bash htb-init/htb-init.sh example 192.0.2.10
+cd "$HOME/htb_labs/example"
+./inspect.sh
 ```
 
-Strongly recommended:
+Use a short box name without `.htb`. New workspaces default to `$HOME/htb_labs/<box>`. To choose another root:
 
 ```bash
-curl
-whatweb
-feroxbuster
-ffuf
-nikto
-dig
-dnsrecon
-gobuster
-smbclient
-enum4linux-ng
-enum4linux
-smbmap
-showmount
-rpcinfo
-snmpwalk
-onesixtyone
-ldapsearch
-jq
-nc
-openssl
-ftp
+HTB_LABS_ROOT="$HOME/assessments" bash htb-init/htb-init.sh example 192.0.2.10
 ```
 
-Optional but useful:
+When a compatible ScopeLens installation is available, the initializer prepares the offline analysis helpers automatically. Otherwise it prints installation and preparation guidance; run `scopelens prepare /path/to/htb-workspace` after installing ScopeLens.
 
-```bash
-httpx
-nuclei
-netexec
-crackmapexec
+The initializer creates a workspace and supporting scripts. The new integration does not run those collection scripts. Add already collected artifacts to `scans/` and `enum/`, then inspect and review the workspace.
+
+## Files you will use
+
+| File or directory | Purpose |
+| --- | --- |
+| `.target.env` | Workspace metadata; ScopeLens reads literal values as text |
+| `scope.json` | Explicit included and excluded IP addresses, networks, and hostnames |
+| `analyze.sh` | Run an offline review with a fresh output directory |
+| `inspect.sh` | Inspect artifact coverage and saved reports |
+| `ANALYSIS.md` | Local instructions for the shared analysis workflow |
+| `scans/`, `enum/` | Existing collected artifacts |
+| `reports/` | Separate review snapshots; excluded from subsequent evidence imports |
+| `notes.md`, `writeup.md` | Your working notes and final writeup |
+
+Preparation preserves existing scope and custom files. It derives initial scope entries from literal `IP` and `HOST` values in `.target.env`; it never sources that file. Review `scope.json` before analysis, particularly when your evidence uses additional hostnames. IP and DNS names are matched independently without DNS resolution.
+
+```json
+{
+  "include": ["192.0.2.10", "example.htb"],
+  "exclude": []
+}
 ```
 
-Optional for online vulnerability intelligence:
+Exclusions take priority. An empty include list admits observed host identifiers except explicit exclusions and produces a warning. A scope file filters evidence; it does not establish authorization.
 
-```text
-Internet access
-NVD API key
+## Inspect and automate
+
+```console
+scopelens inspect /path/to/htb-workspace --json
+scopelens review /path/to/htb-workspace --fail-on medium
+scopelens review /path/to/htb-workspace --format json
+scopelens rules
 ```
 
-Notes:
+Inspection reads the workspace without creating a report. Its loaded file count means readable artifacts; the analysis report separately shows which artifacts were parsed. Review requires a scope file, defaulting to `scope.json`, and always writes to a new report directory. Use `--scope` or `--output` to choose explicit paths. `--fail-on` returns exit code `1` when a finding reaches the selected severity, after saving reports. Exit code `2` indicates invalid input or another error; an analysis with no observations also returns `2` and saves coverage diagnostics. Review the diagnostics even when the exit code is `0`.
 
-- If ProjectDiscovery `httpx` is available, `recon.sh` uses it for HTTP/HTTPS probing.
-- If another tool named `httpx` is installed, `recon.sh` detects this and falls back to curl.
-- If `httpx` is missing entirely, `recon.sh` also falls back to curl.
-- `enum4linux` and `enum4linux-ng` are useful but can be noisy or slow on Windows/AD targets, so they are timeout-wrapped.
-- `analyze-recon.py` uses only the Python standard library.
-- Online vulnerability lookup is optional and must be explicitly enabled.
+For an existing ZIP archive or a single supported artifact, use the explicit analysis command:
 
----
-
-## What It Creates
-
-```text
-/home/zendeni/htb_labs/<box>/
-├── .target.env
-├── update-hosts.sh
-├── recon.sh
-├── zip-recon.sh
-├── privesc-linux.md
-├── notes.md
-├── writeup.md
-├── README.md
-├── scans/
-├── enum/
-│   ├── web/
-│   ├── dns/
-│   ├── smb/
-│   ├── ftp/
-│   ├── nfs/
-│   ├── snmp/
-│   ├── ldap/
-│   ├── kerberos/
-│   ├── rpc/
-│   ├── winrm/
-│   ├── ssh/
-│   └── other/
-├── loot/
-├── exploits/
-├── shells/
-├── screenshots/
-└── tools/
+```console
+scopelens analyze /path/to/recon.zip -o /path/to/new-review --scope /path/to/scope.json
 ```
 
-After `recon.sh` runs, it also creates:
+`analyze` requires a new output directory and uses a scope file only when you supply `--scope`. ZIP contents are read in place, without extraction or execution.
 
-```text
-summary.md
-recon-console.log
-<box>-recon-<timestamp>.zip
-```
+## Compatibility and limits
 
-If `analyze-recon.py` is run against the workspace, it creates:
+ScopeLens supports existing Nmap XML/text, httpx JSONL/text, saved HTTP headers, ffuf JSON, npm lockfiles, and pinned Python requirements. Other artifacts may remain useful for manual inspection without having a dedicated parser. See the [shared compatibility guide](https://github.com/Zendeni/scopelens/blob/main/docs/compatibility.md) for supported fields, limits, and diagnostics.
 
-```text
-recon-analysis.md
-```
+Reports retain source locations and hashes, and redact common secret patterns. Redaction is best effort: review reports before sharing. Raw workspace archives preserve original evidence and can contain sensitive material. Analysis reports are stored separately and are not automatically included in those archives.
 
----
+Changes between reports describe differences in supplied evidence. A removed finding can reflect changed collection or parser coverage and does not by itself prove remediation.
 
-## Main Generated Files
+## Earlier workflow
 
-### `.target.env`
+The existing collection scripts and `analyze-recon.py` remain available. ScopeLens is the shared reporting path described above. The [original workflow documentation](docs/legacy-workflow.md) is retained as a historical reference for existing users; its analyzer and command options are separate from ScopeLens.
 
-Stores machine-specific variables used by the helper scripts:
-
-```bash
-BOX="principal"
-IP="10.129.244.220"
-HOST="principal.htb"
-BASE_DIR="/home/zendeni/htb_labs/principal"
-```
-
-The generated helper scripts source this file, which makes them location-aware and reusable.
-
----
-
-### `update-hosts.sh`
-
-Safely updates `/etc/hosts` for the current target.
-
-Run it from inside the box folder:
-
-```bash
-./update-hosts.sh
-```
-
-It removes old entries for the same hostname and adds the current one:
-
-```text
-10.129.244.220 principal.htb
-```
-
-The script avoids unsafe regex-based deletion and updates only entries where the hostname matches as a field.
-
----
-
-### `recon.sh`
-
-Runs automated first-stage recon against the target.
-
-Run:
-
-```bash
-./recon.sh
-```
-
-It performs:
-
-```text
-- Tool availability check
-- Full TCP port scan
-- TCP service/version enumeration
-- TCP aggressive scan
-- TCP default/safe Nmap scripts
-- UDP top ports scan
-- HTTP/HTTPS discovery
-- Web enumeration with whatweb, curl, feroxbuster, ffuf, nikto
-- Host-header web checks
-- JavaScript extraction and keyword grep
-- DNS enumeration if port 53 is open
-- SMB enumeration if ports 139/445 are open
-- FTP enumeration if port 21 is open
-- SSH enumeration if port 22 is open
-- NFS/RPC enumeration if relevant ports are open
-- SNMP enumeration if UDP/161 is found
-- LDAP enumeration if LDAP ports are open
-- Kerberos enumeration if port 88 is open
-- WinRM enumeration if ports 5985/5986 are open
-- Optional Nmap vulnerability script scan
-- Interesting keyword grep
-- Recon summary generation
-- Automatic ZIP archive generation
-```
-
-Important generated outputs:
-
-```text
-summary.md
-recon-console.log
-scans/tcp-full.txt
-scans/tcp-services.txt
-scans/tcp-aggressive.txt
-scans/tcp-default-safe-scripts.txt
-scans/tcp-vuln.txt
-scans/udp-top100.txt
-scans/port-summary.md
-enum/web/live-web-urls.txt
-enum/web/curl-web-probe.txt
-enum/interesting-grep.txt
-```
-
----
-
-### `zip-recon.sh`
-
-Creates a ZIP archive of recon material.
-
-Run manually with:
-
-```bash
-./zip-recon.sh
-```
-
-`recon.sh` also runs it automatically at the end.
-
-The archive includes:
-
-```text
-.target.env
-scans/
-enum/
-notes.md
-writeup.md
-README.md
-recon.sh
-update-hosts.sh
-zip-recon.sh
-privesc-linux.md
-summary.md
-recon-console.log
-```
-
-It excludes bulky or sensitive folders/files:
-
-```text
-loot/
-exploits/
-shells/
-screenshots/
-*.pcap
-*.cap
-*.zip
-```
-
----
-
-### `notes.md`
-
-Working notes for:
-
-```text
-- Target info
-- Open ports
-- Credentials
-- Interesting findings
-- Attack ideas
-- Foothold
-- Privilege escalation
-- Loot
-- Proofs
-```
-
-If `notes.md` already exists, `htb-init` leaves it unchanged.
-
----
-
-### `writeup.md`
-
-Starter writeup template with sections for:
-
-```text
-- Enumeration
-- Initial access
-- Local enumeration
-- Privilege escalation
-- Attack chain summary
-- MITRE ATT&CK mapping
-- Remediation summary
-```
-
-If `writeup.md` already exists, `htb-init` leaves it unchanged.
-
----
-
-### `privesc-linux.md`
-
-Linux privilege escalation checklist covering:
-
-```text
-- Current user/context
-- sudo permissions
-- Users and groups
-- SUID/SGID binaries
-- Capabilities
-- Writable paths
-- Processes/services
-- Cron jobs
-- Interesting files
-- Shell stabilization
-```
-
----
-
-## `analyze-recon.py`
-
-`analyze-recon.py` is a standalone recon analysis helper.
-
-It does **not** run exploitation. It does **not** modify the target. It reads collected recon output and generates a prioritized analysis report.
-
-It supports:
-
-```text
-- Extracted HTB workspace folders
-- ZIP archives generated by zip-recon.sh
-- Offline analysis by default
-- Optional online vulnerability intelligence lookup
-```
-
-Example against a workspace folder:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal
-```
-
-Example against a recon ZIP:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal/principal-recon-20260524-135821.zip
-```
-
-Example with terminal output:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal --print
-```
-
-It generates:
-
-```text
-recon-analysis.md
-```
-
-Depending on the available data, it attempts to extract and summarize:
-
-```text
-- Target metadata
-- Open ports
-- Detected services
-- Detected technologies
-- Likely machine profile
-- Web URLs
-- Web headers
-- Forms and input fields
-- JavaScript references
-- API endpoints
-- Authentication-related clues
-- SMB shares
-- LDAP naming contexts
-- AD/DC indicators
-- MSSQL indicators
-- WinRM indicators
-- Detected packages/components
-- Top vulnerability candidates
-- Vulnerability intelligence
-- Vulnerability references
-- High-value next steps
-- CVE/research search suggestions
-- Interesting grep highlights
-```
-
-Example output sections:
-
-```text
-Detected Profile
-Open Ports
-Detected Technologies
-Web Intelligence
-Detected Packages / Components
-Top Vulnerability Candidates
-Vulnerability Intelligence
-Vulnerability References
-Prioritized Findings and Next Steps
-CVE / Research Search Suggestions
-Interesting Grep Highlights
-Files Parsed
-```
-
-Treat all suggestions from `analyze-recon.py` as hypotheses requiring manual validation.
-
----
-
-## Online Vulnerability Intelligence
-
-By default, `analyze-recon.py` runs offline.
-
-To enable OSV and NVD lookup:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal --online-vuln-check
-```
-
-This enriches the report with:
-
-```text
-- OSV package/version matches
-- NVD keyword/CVE matches
-- Top vulnerability candidates
-- Severity
-- Relevance score
-- Advisory references
-```
-
-Example:
-
-```bash
-cd /home/zendeni/htb_labs/reactor
-
-/home/zendeni/tools/htb/analyze-recon.py . --online-vuln-check
-```
-
-Example output summary:
-
-```text
-[+] Recon root: /home/zendeni/htb_labs/reactor
-[+] Parsed files: 63
-[+] Open ports parsed: 2
-[+] Findings generated: 6
-[+] Packages/components detected: 3
-[+] Vulnerability matches: 40
-[+] Wrote analysis: /home/zendeni/htb_labs/reactor/recon-analysis.md
-```
-
-The report can identify exact package/version matches, such as:
-
-```text
-npm:next 15.0.3
-npm:react 19.0.0-rc
-npm:react-server-dom-webpack
-```
-
-And it can rank relevant findings, such as:
-
-```text
-GHSA-9qr9-h5gf-34mp / CVE-2025-55182
-Authorization Bypass in Next.js Middleware
-React Server Components issues
-Next.js Server Actions issues
-```
-
-### NVD API Key
-
-NVD can be queried without an API key, but an API key is recommended to reduce rate-limit problems.
-
-Set it as an environment variable:
-
-```bash
-export NVD_API_KEY='your-api-key-here'
-```
-
-Then run:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal --online-vuln-check
-```
-
-Or pass it directly:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal   --online-vuln-check   --nvd-api-key 'your-api-key-here'
-```
-
-### Vulnerability Cache
-
-The analyzer can cache vulnerability lookup results.
-
-Use a custom cache path:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal   --online-vuln-check   --vuln-cache ~/.cache/htb-recon/vuln-cache.json
-```
-
-Recommended pattern:
-
-```bash
-mkdir -p ~/.cache/htb-recon
-
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal   --online-vuln-check   --vuln-cache ~/.cache/htb-recon/vuln-cache.json
-```
-
-### Offline vs Online Mode
-
-Offline mode is best for fast, repeatable analysis:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal
-```
-
-Online mode is best when you want current vulnerability intelligence:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/principal --online-vuln-check
-```
-
-The online results are useful, but still require manual validation. Exact OSV package/version matches are usually stronger than broad NVD keyword matches.
-
----
-
-## Recommended Workflow
-
-### 1. Initialize the box
-
-```bash
-htb-init principal 10.129.244.220
-```
-
-### 2. Enter the workspace
-
-```bash
-cd /home/zendeni/htb_labs/principal
-```
-
-### 3. Update `/etc/hosts`
-
-```bash
-./update-hosts.sh
-```
-
-### 4. Run recon
-
-```bash
-./recon.sh
-```
-
-### 5. Review the raw recon summary
-
-```bash
-less summary.md
-```
-
-### 6. Run offline recon analysis
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py .
-```
-
-Review:
-
-```bash
-less recon-analysis.md
-```
-
-### 7. Run online vulnerability-enriched analysis
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py . --online-vuln-check
-```
-
-Review:
-
-```bash
-less recon-analysis.md
-```
-
-### 8. Archive recon
-
-Usually this is already done automatically by `recon.sh`, but it can also be run manually:
-
-```bash
-./zip-recon.sh
-```
-
----
-
-## Useful Review Commands
-
-```bash
-cat scans/open-tcp-ports.txt
-cat scans/port-summary.md
-cat enum/web/live-web-urls.txt
-cat enum/web/curl-web-probe.txt
-cat enum/interesting-grep.txt
-less summary.md
-less recon-analysis.md
-```
-
-For Windows/AD-style boxes:
-
-```bash
-cat enum/smb/smbclient-null.txt 2>/dev/null
-cat enum/smb/netexec-smb.txt 2>/dev/null
-cat enum/ldap/namingcontexts.txt 2>/dev/null
-cat enum/winrm/netexec-winrm.txt 2>/dev/null
-cat scans/port-summary.md
-```
-
-For web-heavy boxes:
-
-```bash
-cat enum/web/live-web-urls.txt
-grep -RniE "fetch|axios|/api/|token|auth|login|admin|dashboard|password|secret" enum/web/
-find enum/web -type f -size +0c | sort
-```
-
-For vulnerability-enriched reports:
-
-```bash
-grep -n "Top Vulnerability Candidates" -A20 recon-analysis.md
-grep -n "Vulnerability Intelligence" -A40 recon-analysis.md
-grep -n "Prioritized Findings" -A80 recon-analysis.md
-```
-
----
-
-## Safety and Validation
-
-`htb-init` validates:
-
-```text
-- Box name format
-- Short box name only, not box.htb
-- IPv4 address format
-- IPv4 octets between 0 and 255
-```
-
-It does **not** overwrite existing:
-
-```text
-notes.md
-writeup.md
-```
-
-This prevents accidental loss of manual notes or report work when rerunning `htb-init`.
-
-The recon workflow is intended for authorized lab targets only.
-
-`analyze-recon.py` does not exploit targets. It only reads local recon output and optionally queries public vulnerability databases for enrichment.
-
----
-
-## Example
-
-```bash
-htb-init bounty 10.129.37.20
-cd /home/zendeni/htb_labs/bounty
-./update-hosts.sh
-./recon.sh
-less summary.md
-```
-
-Result:
-
-```text
-/home/zendeni/htb_labs/bounty/
-```
-
-with:
-
-```text
-bounty.htb
-10.129.37.20
-```
-
-and a generated archive like:
-
-```text
-bounty-recon-20260524-153000.zip
-```
-
-Optional offline analysis:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/bounty
-less /home/zendeni/htb_labs/bounty/recon-analysis.md
-```
-
-Optional online vulnerability-enriched analysis:
-
-```bash
-/home/zendeni/tools/htb/analyze-recon.py /home/zendeni/htb_labs/bounty --online-vuln-check
-less /home/zendeni/htb_labs/bounty/recon-analysis.md
-```
-
----
-
-## Notes
-
-This tool is designed for personal HTB methodology, repeatability, and clean writeup preparation.
-
-It does not perform exploitation. It creates a workspace, runs first-stage enumeration, packages recon data, and optionally analyzes collected recon artifacts for likely next steps and vulnerability intelligence.
-
-Keep `htb-init.sh` stable. Develop and improve `analyze-recon.py` separately so recon collection remains reliable.
+For ScopeLens development and verification, see its [README](https://github.com/Zendeni/scopelens#development) and [architecture](https://github.com/Zendeni/scopelens/blob/main/docs/architecture.md).

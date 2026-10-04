@@ -2,16 +2,49 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<'USAGE'
+Usage:
+  htb-init.sh <box-name> <target-ip>
+  htb-init.sh --prepare <existing-workspace>
+  htb-init.sh --inspect <workspace> [--json]
+  htb-init.sh --review <workspace> [ScopeLens review options]
+
+Workspaces: $HOME/htb_labs by default; override with HTB_LABS_ROOT.
+Offline review commands require ScopeLens 0.2+ in the selected Python.
+Override the Python executable with HTB_PYTHON (default: python3).
+USAGE
+}
+
+REVIEW_PYTHON="${HTB_PYTHON:-python3}"
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --prepare|--inspect|--review)
+        REVIEW_COMMAND="${1#--}"
+        shift
+        if ! command -v "$REVIEW_PYTHON" >/dev/null 2>&1 ||
+           ! "$REVIEW_PYTHON" -I -c 'import scopelens.workspace' >/dev/null 2>&1; then
+            echo "[-] Offline review requires ScopeLens 0.2+ in $REVIEW_PYTHON." >&2
+            echo "    Activate the environment where ScopeLens is installed, or set HTB_PYTHON." >&2
+            echo "    Setup: https://github.com/Zendeni/scopelens#try-it" >&2
+            exit 2
+        fi
+        exec "$REVIEW_PYTHON" -I -m scopelens "$REVIEW_COMMAND" "$@"
+        ;;
+esac
+
 if [ "$#" -ne 2 ]; then
-    echo "Usage: htb-init <box-name> <target-ip>"
-    echo "Example: htb-init principal 10.129.244.220"
-    exit 1
+    usage >&2
+    exit 2
 fi
 
 BOX="$1"
 IP="$2"
 
-if [[ ! "$BOX" =~ ^[A-Za-z0-9._-]+$ ]]; then
+if [[ ! "$BOX" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$BOX" == "." || "$BOX" == ".." ]]; then
     echo "[-] Invalid box name. Use letters, numbers, dot, underscore, or dash."
     exit 1
 fi
@@ -28,15 +61,22 @@ fi
 
 IFS='.' read -r o1 o2 o3 o4 <<< "$IP"
 for octet in "$o1" "$o2" "$o3" "$o4"; do
-    if (( octet < 0 || octet > 255 )); then
+    if (( 10#$octet > 255 )); then
         echo "[-] Invalid IPv4 address octet: $octet"
         exit 1
     fi
 done
 
+printf -v IP '%d.%d.%d.%d' "$((10#$o1))" "$((10#$o2))" "$((10#$o3))" "$((10#$o4))"
+
 HOST="${BOX}.htb"
-BASE_ROOT="/home/zendeni/htb_labs"
+BASE_ROOT="${HTB_LABS_ROOT:-${HOME:?HOME must be set}/htb_labs}"
 BASE_DIR="$BASE_ROOT/$BOX"
+
+if [[ -L "$BASE_DIR" || -L "$BASE_DIR/.target.env" ]]; then
+    echo "[-] Refusing a linked workspace or target configuration: $BASE_DIR" >&2
+    exit 2
+fi
 
 echo "[+] Creating HTB workspace for $BOX"
 echo "[+] Target IP: $IP"
@@ -45,6 +85,7 @@ echo "[+] Workspace: $BASE_DIR"
 
 mkdir -p "$BASE_DIR"/{scans,enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other},loot/{copied,searches},exploits,shells,screenshots,tools}
 cd "$BASE_DIR"
+BASE_DIR="$PWD"
 
 cat > .target.env <<EOF
 BOX="$BOX"
@@ -52,8 +93,8 @@ IP="$IP"
 HOST="$HOST"
 # Extra vhost base domains discovered from redirects are stored during recon in:
 #   enum/dns/vhost-base-domains.txt
-BASE_DIR="$BASE_DIR"
 EOF
+printf 'BASE_DIR=%q\n' "$BASE_DIR" >> .target.env
 
 cat > update-hosts.sh <<'EOF'
 #!/usr/bin/env bash
@@ -342,8 +383,16 @@ fi
 
 echo "[+] Creating recon archive: $OUTFILE"
 
+REVIEW_FILES=()
+for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md; do
+    if [[ -f "$REVIEW_FILE" && ! -L "$REVIEW_FILE" ]]; then
+        REVIEW_FILES+=("$REVIEW_FILE")
+    fi
+done
+
 zip -r "$OUTFILE" \
     .target.env \
+    "${REVIEW_FILES[@]}" \
     scans/ \
     enum/ \
     notes.md \
@@ -2113,6 +2162,24 @@ cat > README.md <<EOF
 * IP: $IP
 * Hostname: $HOST
 
+## Offline Analysis and Inspection
+
+Install ScopeLens 0.2+ in your active Python environment, then prepare an existing
+workspace once with \`scopelens prepare .\`. New workspaces are prepared
+automatically when ScopeLens is available to the initializer.
+
+\`\`\`bash
+./inspect.sh
+./analyze.sh
+# After the first report, compare the next snapshot:
+./analyze.sh --baseline latest
+\`\`\`
+
+Review \`scope.json\` before analysis. User scope exclusions and notes are
+preserved. Reports go into separate directories under \`reports/\`; open the
+printed \`report.html\` path to inspect the results. See \`ANALYSIS.md\` for
+the full local review workflow. These commands analyze existing evidence.
+
 ## Recommended Launch Flow
 
 \`\`\`bash
@@ -2193,3 +2260,21 @@ echo "[+] Next commands:"
 echo "cd $BASE_DIR"
 echo "./update-hosts.sh"
 echo "./recon.sh"
+
+# ScopeLens only reads collected artifacts. Keep this integration outside the
+# generated collector so review never starts network collection implicitly.
+echo
+if command -v "$REVIEW_PYTHON" >/dev/null 2>&1 &&
+   "$REVIEW_PYTHON" -I -c 'import scopelens.workspace' >/dev/null 2>&1; then
+    if "$REVIEW_PYTHON" -I -m scopelens prepare "$BASE_DIR" --name "$BOX"; then
+        echo "[+] Offline review: ./inspect.sh, then ./analyze.sh"
+        echo "[+] Compare a later snapshot: ./analyze.sh --baseline latest"
+    else
+        echo "[!] Workspace created; offline review setup needs attention." >&2
+        echo "    Run: scopelens prepare \"$BASE_DIR\"" >&2
+    fi
+else
+    echo "[i] Install ScopeLens 0.2+ to add offline analysis and inspection:"
+    echo "    https://github.com/Zendeni/scopelens#try-it"
+    echo "    Then run: scopelens prepare \"$BASE_DIR\""
+fi
