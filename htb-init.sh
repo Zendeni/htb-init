@@ -9,6 +9,8 @@ Usage:
   htb-init.sh --prepare <existing-workspace>
   htb-init.sh --inspect <workspace> [--json]
   htb-init.sh --review <workspace> [ScopeLens review options]
+  htb-init.sh --doctor
+  htb-init.sh --rules
 
 Workspaces: $HOME/htb_labs by default; override with HTB_LABS_ROOT.
 Offline review commands require ScopeLens 0.2+ in the selected Python.
@@ -16,23 +18,65 @@ Override the Python executable with HTB_PYTHON (default: python3).
 USAGE
 }
 
+# Offline integration stays in this entrypoint so copied installations keep
+# working. All commands use the same interpreter, isolated from workspace code.
 REVIEW_PYTHON="${HTB_PYTHON:-python3}"
+
+scopelens_available() {
+    command -v "$REVIEW_PYTHON" >/dev/null 2>&1 &&
+        "$REVIEW_PYTHON" -I -c 'import scopelens.workspace' >/dev/null 2>&1
+}
+
+scopelens_setup_hint() {
+    echo "    Activate the environment where ScopeLens is installed, or set HTB_PYTHON."
+    echo "    Setup: https://github.com/Zendeni/scopelens#try-it"
+}
+
+dispatch_offline() {
+    local command="$1"
+    shift
+    if ! scopelens_available; then
+        echo "[-] Offline review requires ScopeLens 0.2+ in $REVIEW_PYTHON." >&2
+        scopelens_setup_hint >&2
+        return 2
+    fi
+    # exec preserves ScopeLens exit codes, including review thresholds and
+    # interruptions. Pass arguments as separate values, without shell parsing.
+    exec "$REVIEW_PYTHON" -I -m scopelens "$command" "$@"
+}
+
+prepare_offline_review() {
+    local workspace="$1" name="$2"
+    if ! scopelens_available; then
+        echo "[i] Install ScopeLens 0.2+ to add offline analysis and inspection:"
+        scopelens_setup_hint
+        printf '    Then run: scopelens prepare %q\n' "$workspace"
+        return 0
+    fi
+    if "$REVIEW_PYTHON" -I -m scopelens prepare "$workspace" --name "$name"; then
+        echo "[+] Offline review: ./inspect.sh, then ./analyze.sh"
+        echo "[+] Compare a later snapshot: ./analyze.sh --baseline latest"
+    else
+        echo "[!] Workspace created; offline review setup needs attention." >&2
+        printf '    Run: scopelens prepare %q\n' "$workspace" >&2
+    fi
+}
+
 case "${1:-}" in
     -h|--help)
         usage
         exit 0
         ;;
-    --prepare|--inspect|--review)
+    --prepare|--inspect|--review|--doctor|--rules)
         REVIEW_COMMAND="${1#--}"
         shift
-        if ! command -v "$REVIEW_PYTHON" >/dev/null 2>&1 ||
-           ! "$REVIEW_PYTHON" -I -c 'import scopelens.workspace' >/dev/null 2>&1; then
-            echo "[-] Offline review requires ScopeLens 0.2+ in $REVIEW_PYTHON." >&2
-            echo "    Activate the environment where ScopeLens is installed, or set HTB_PYTHON." >&2
-            echo "    Setup: https://github.com/Zendeni/scopelens#try-it" >&2
-            exit 2
-        fi
-        exec "$REVIEW_PYTHON" -I -m scopelens "$REVIEW_COMMAND" "$@"
+        dispatch_offline "$REVIEW_COMMAND" "$@"
+        exit $?
+        ;;
+    --*)
+        printf '[-] Unknown option: %s\n' "$1" >&2
+        usage >&2
+        exit 2
         ;;
 esac
 
@@ -2264,17 +2308,4 @@ echo "./recon.sh"
 # ScopeLens only reads collected artifacts. Keep this integration outside the
 # generated collector so review never starts network collection implicitly.
 echo
-if command -v "$REVIEW_PYTHON" >/dev/null 2>&1 &&
-   "$REVIEW_PYTHON" -I -c 'import scopelens.workspace' >/dev/null 2>&1; then
-    if "$REVIEW_PYTHON" -I -m scopelens prepare "$BASE_DIR" --name "$BOX"; then
-        echo "[+] Offline review: ./inspect.sh, then ./analyze.sh"
-        echo "[+] Compare a later snapshot: ./analyze.sh --baseline latest"
-    else
-        echo "[!] Workspace created; offline review setup needs attention." >&2
-        echo "    Run: scopelens prepare \"$BASE_DIR\"" >&2
-    fi
-else
-    echo "[i] Install ScopeLens 0.2+ to add offline analysis and inspection:"
-    echo "    https://github.com/Zendeni/scopelens#try-it"
-    echo "    Then run: scopelens prepare \"$BASE_DIR\""
-fi
+prepare_offline_review "$BASE_DIR" "$BOX"

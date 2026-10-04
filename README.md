@@ -57,9 +57,11 @@ You can also use the htb-init entrypoint:
 bash htb-init/htb-init.sh --prepare /path/to/htb-workspace
 bash htb-init/htb-init.sh --inspect /path/to/htb-workspace --json
 bash htb-init/htb-init.sh --review /path/to/htb-workspace
+bash htb-init/htb-init.sh --doctor
+bash htb-init/htb-init.sh --rules
 ```
 
-These commands use the installed ScopeLens package.
+These commands use the installed ScopeLens package. `--doctor` shows the selected runtime and capabilities; `--rules` lists its review rules. The adapter keeps argument values and ScopeLens exit codes intact and ignores Python modules in the current workspace.
 
 ## Create a new workspace
 
@@ -137,3 +139,16 @@ Changes between reports describe differences in supplied evidence. A removed fin
 The existing collection scripts and `analyze-recon.py` remain available. ScopeLens is the shared reporting path described above. The [original workflow documentation](docs/legacy-workflow.md) is retained as a historical reference for existing users; its analyzer and command options are separate from ScopeLens.
 
 For ScopeLens development and verification, see its [README](https://github.com/Zendeni/scopelens#development) and [architecture](https://github.com/Zendeni/scopelens/blob/main/docs/architecture.md).
+
+## Maintaining the integration
+
+The offline adapter at the top of `htb-init.sh` owns interpreter selection, dependency checks, command dispatch, and optional preparation after initialization. It is kept in the entrypoint so a copied script remains usable. ScopeLens owns artifact parsing, scope, findings, and report generation; this repository delegates those operations to its installed package.
+
+From this checkout, with ScopeLens installed in the active environment:
+
+```bash
+bash -n htb-init.sh
+python -m unittest discover -s tests -v
+```
+
+The integration tests exercise preparation, inspection, reporting, threshold and error statuses, copied entrypoints, and untrusted metadata using synthetic local artifacts. They do not run collection. CI installs a pinned ScopeLens revision so the tested pairing is explicit. When changing the shared interface, test both repositories and update that pin together.

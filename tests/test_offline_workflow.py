@@ -27,9 +27,9 @@ class OfflineWorkflowTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def call(self, *args, script=None):
+    def call(self, *args, script=None, cwd=None):
         return subprocess.run([BASH, str(script or ROOT / "htb-init.sh"), *map(str, args)],
-                              env=self.env, text=True, encoding="utf-8", capture_output=True, timeout=30)
+                              env=self.env, cwd=cwd, text=True, encoding="utf-8", capture_output=True, timeout=30)
 
     def test_help_does_not_require_scopelens_or_create_workspace(self):
         self.env["HTB_PYTHON"] = "missing-python-for-test"
@@ -43,6 +43,38 @@ class OfflineWorkflowTests(unittest.TestCase):
         result = self.call("--inspect", self.workspace)
         self.assertEqual(result.returncode, 2)
         self.assertIn("ScopeLens 0.2+", result.stderr)
+
+    def test_diagnostics_and_rule_catalog_share_installed_package(self):
+        doctor = self.call("--doctor")
+        self.assertEqual(doctor.returncode, 0, doctor.stderr)
+        self.assertIn("ScopeLens", doctor.stdout)
+        rules = self.call("--rules")
+        self.assertEqual(rules.returncode, 0, rules.stderr)
+        self.assertIn("SL001", rules.stdout)
+        self.assertFalse((self.workspace / "must-not-create").exists())
+
+    def test_unknown_option_is_rejected_before_dependency_check(self):
+        self.env["HTB_PYTHON"] = "missing-python-for-test"
+        result = self.call("--reveiw", self.workspace)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Unknown option: --reveiw", result.stderr)
+        self.assertNotIn("requires ScopeLens", result.stderr)
+        self.assertFalse((self.workspace / "must-not-create").exists())
+
+    def test_copied_entrypoint_ignores_workspace_python_modules(self):
+        entrypoint = self.workspace / "htb-init.sh"
+        shutil.copyfile(ROOT / "htb-init.sh", entrypoint)
+        (self.workspace / "scopelens.py").write_text(
+            'raise RuntimeError("workspace module must never execute")\n', encoding="utf-8")
+        result = self.call("--inspect", self.workspace, "--json", script=entrypoint, cwd=self.workspace)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["workspace"], str(self.workspace.resolve()))
+
+    def test_review_usage_errors_preserve_exit_code_and_do_not_write_reports(self):
+        result = self.call("--review", self.workspace, "--format", "invalid")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice", result.stderr)
+        self.assertFalse((self.workspace / "reports").exists())
 
     def test_prepare_preserves_custom_scope_and_notes(self):
         scope = '{"include":["192.0.2.10"],"exclude":["192.0.2.99"]}\n'

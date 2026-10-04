@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install matching ScopeLens
-        run: python -m pip install "git+https://github.com/Zendeni/scopelens.git@5c5574b83ca75c16f4a8f9211d5e2c6205ab8dc3"
+        run: python -m pip install "git+https://github.com/Zendeni/scopelens.git@b2a5a5ce4d64c9298718022982a04d481a7d00d4"
       - name: Check shell syntax
         run: bash -n htb-init.sh
       - name: Test offline integration
