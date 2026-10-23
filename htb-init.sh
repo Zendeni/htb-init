@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+INITIALIZER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
     cat <<'USAGE'
 Usage:
@@ -139,6 +141,24 @@ HOST="$HOST"
 #   enum/dns/vhost-base-domains.txt
 EOF
 printf 'BASE_DIR=%q\n' "$BASE_DIR" >> .target.env
+
+# Keep the assessor alongside its workspace so it remains usable independently
+# of this checkout. A copied initializer still works without the optional asset.
+if [[ -f "$INITIALIZER_DIR/web-assess.py" ]]; then
+    if [[ "$INITIALIZER_DIR" != "$BASE_DIR" ]]; then
+        cp "$INITIALIZER_DIR/web-assess.py" ./web-assess.py
+    fi
+    cat > web-assess.sh <<'WEB_ASSESS_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${HTB_PYTHON:-python3}" -I "$SCRIPT_DIR/web-assess.py" --workspace "$SCRIPT_DIR" "$@"
+WEB_ASSESS_EOF
+    chmod +x web-assess.sh
+else
+    echo "[i] web-assess.py is not alongside the initializer; automatic web assessment unavailable."
+    echo "    Use the full repository checkout to install the web assessment helper."
+fi
 
 cat > update-hosts.sh <<'EOF'
 #!/usr/bin/env bash
@@ -428,7 +448,7 @@ fi
 echo "[+] Creating recon archive: $OUTFILE"
 
 REVIEW_FILES=()
-for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md; do
+for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md web-assess.sh web-assess.py; do
     if [[ -f "$REVIEW_FILE" && ! -L "$REVIEW_FILE" ]]; then
         REVIEW_FILES+=("$REVIEW_FILE")
     fi
@@ -583,6 +603,7 @@ START_TIME="$(date)"
 #   RECON_DEEP=1 FEROX_EXTENSIONS=1 FEROX_COLLECT=1 FFUF_CONTENT=1 ./recon.sh
 RECON_DEEP="${RECON_DEEP:-0}"
 WEB_ENUM="${WEB_ENUM:-1}"
+WEB_ASSESS="${WEB_ASSESS:-1}"
 FEROX_ENABLE="${FEROX_ENABLE:-1}"
 FEROX_EXTENSIONS="${FEROX_EXTENSIONS:-0}"
 FEROX_COLLECT="${FEROX_COLLECT:-0}"
@@ -596,6 +617,9 @@ FEROX_THREADS="${FEROX_THREADS:-10}"
 MAX_WEB_URLS="${MAX_WEB_URLS:-4}"
 MAX_WEB_WORDLISTS="${MAX_WEB_WORDLISTS:-1}"
 MAX_FFUF_WORDLISTS="${MAX_FFUF_WORDLISTS:-1}"
+# Deduplicate successful scans within this run only. Persisted .done files used
+# to suppress later recon runs, even after a timeout or failed ffuf invocation.
+declare -A VHOST_SCANS_DONE=()
 
 have() {
     command -v "$1" >/dev/null 2>&1
@@ -756,7 +780,7 @@ ffuf_extensions_arg() {
 wordlist_line_count() {
     local wordlist="$1"
     if [ -f "$wordlist" ]; then
-        grep -vE '^[[:space:]]*(#|$)' "$wordlist" 2>/dev/null | wc -l | tr -d ' '
+        awk '!/^[[:space:]]*(#|$)/ { count++ } END { print count+0 }' "$wordlist"
     else
         echo 0
     fi
@@ -1050,7 +1074,7 @@ run_ffuf_content_plan() {
 run_vhost_ffuf() {
     local url="$1"
     local safe_url="$2"
-    local scheme port lock_file base_domain safe_base output_file
+    local scheme port scan_key base_domain safe_base output_file label vhost_wordlist
 
     if [ "$WEB_ENUM" != "1" ]; then
         echo "[!] Skipping ffuf vhost discovery because WEB_ENUM=$WEB_ENUM."
@@ -1070,8 +1094,8 @@ run_vhost_ffuf() {
         return 0
     fi
 
-    if [ -z "$DNS_WORDLIST" ]; then
-        echo "[!] Skipping ffuf vhost discovery: no DNS wordlist found."
+    if [ ! -f "$PRIORITY_VHOST_WORDLIST" ] && [ ! -f "$DNS_WORDLIST" ]; then
+        echo "[!] Skipping ffuf vhost discovery: no vhost wordlist found."
         return 0
     fi
 
@@ -1096,17 +1120,15 @@ run_vhost_ffuf() {
             [ -f "$vhost_wordlist" ] || continue
 
             label="$(safe_name "$(basename "$vhost_wordlist")")"
-            lock_file="enum/web/.ffuf-vhost-$scheme-$port-$safe_base-$label.done"
+            scan_key="$scheme/$port/$base_domain/$vhost_wordlist"
             output_file="enum/web/ffuf-vhosts-$safe_url-$safe_base-$label.json"
 
-            if [ -f "$lock_file" ]; then
+            if [ "${VHOST_SCANS_DONE[$scan_key]:-0}" = "1" ]; then
                 echo "[!] Skipping duplicate ffuf vhost scan for $scheme/$port base $base_domain wordlist $label."
                 continue
             fi
-            touch "$lock_file"
-
             echo "[+] Running bounded ffuf vhost discovery with $vhost_wordlist against base domain: $base_domain"
-            run_with_timeout "$FFUF_MAXTIME" ffuf \
+            if run_with_timeout "$FFUF_MAXTIME" ffuf \
                 -noninteractive \
                 -ac \
                 -t "$FFUF_THREADS" \
@@ -1116,7 +1138,11 @@ run_vhost_ffuf() {
                 -u "$url/" \
                 -H "Host: FUZZ.$base_domain" \
                 -of json \
-                -o "$output_file" || true
+                -o "$output_file"; then
+                VHOST_SCANS_DONE["$scan_key"]=1
+            else
+                echo "[!] ffuf vhost scan did not complete: $base_domain ($label). It may be retried."
+            fi
         done
     done < enum/dns/vhost-base-domains.txt
 }
@@ -1223,8 +1249,15 @@ probe_discovered_hostnames() {
         return 0
     fi
 
-    ports_to_probe="$(ports_lines | grep -E '^(80|443|8000|8080|8443|3000|5000|9000|9090)$' | sort -nu | tr '\n' ' ')"
-    [ -n "$ports_to_probe" ] || ports_to_probe="80 443"
+    # An SSH-only target used to exit here under pipefail because grep found no
+    # common HTTP port. Also include HTTP services found on nonstandard ports.
+    ports_to_probe="$({
+        ports_lines | grep -E '^(80|443|8000|8080|8443|3000|5000|9000|9090)$' || true
+        while read -r url; do
+            [ -n "$url" ] && url_port "$url"
+        done < enum/web/live-web-urls.txt
+    } | sort -nu | tr '\n' ' ')"
+    [ -n "$ports_to_probe" ] || return 0
 
     while read -r name; do
         [ -z "$name" ] && continue
@@ -1246,7 +1279,7 @@ probe_discovered_hostnames() {
                 code="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 5 --resolve "$name:$port:$IP" "$url" || true)"
                 echo "$url $code" | tee -a enum/web/discovered-host-web-probe.txt
 
-                if [[ "$code" =~ ^(200|201|202|204|301|302|303|307|308|400|401|403|405|500|502|503)$ ]]; then
+                if [[ "$code" =~ ^[1-5][0-9]{2}$ ]]; then
                     append_unique_line "$url" enum/web/discovered-host-web-urls.txt
                 fi
             done
@@ -1425,9 +1458,14 @@ echo "=============================="
 echo "[+] 1. TCP full port discovery"
 echo "=============================="
 
+: > scans/open-tcp-ports.txt
+# These manifests describe this run. Do not leave prior web targets available
+# to downstream assessment when a later scan finds no open ports or fails.
+: > enum/web/live-web-urls.txt
+: > enum/web/discovered-host-web-urls.txt
 nmap -p- --min-rate 5000 -Pn "$IP" -oN scans/tcp-full.txt
 
-PORTS="$(grep -oP '^\d+/tcp\s+open' scans/tcp-full.txt | cut -d/ -f1 | paste -sd, - || true)"
+PORTS="$(awk '$1 ~ /^[0-9]+\/tcp$/ && $2 == "open" { sub(/\/tcp$/, "", $1); print $1 }' scans/tcp-full.txt | paste -sd, -)"
 
 if [ -z "$PORTS" ]; then
     echo "[-] No open TCP ports found."
@@ -1467,9 +1505,9 @@ echo "======================================"
 echo "[+] 2. TCP service/version enumeration"
 echo "======================================"
 
-nmap -sC -sV -Pn -p "$PORTS" "$IP" -oN scans/tcp-services.txt
+nmap -sC -sV -Pn -p "$PORTS" "$IP" -oN scans/tcp-services.txt -oX scans/tcp-services.xml
 nmap -A -Pn -p "$PORTS" "$IP" -oN scans/tcp-aggressive.txt || true
-nmap --script default,safe -Pn -p "$PORTS" "$IP" -oN scans/tcp-default-safe-scripts.txt || true
+nmap -sV --script default,safe -Pn -p "$PORTS" "$IP" -oN scans/tcp-default-safe-scripts.txt || true
 
 echo
 echo "=============================="
@@ -1537,7 +1575,7 @@ if [ ! -s enum/web/live-web-urls.txt ]; then
         CODE="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 4 "$URL" || true)"
         echo "$URL $CODE" | tee -a enum/web/curl-web-probe.txt
 
-        if [[ "$CODE" =~ ^(200|201|202|204|301|302|303|307|308|400|401|403|405|500|502|503)$ ]]; then
+        if [[ "$CODE" =~ ^[1-5][0-9]{2}$ ]]; then
             echo "$URL" >> enum/web/live-web-urls.txt
         fi
     done < enum/web/web-candidates.txt
@@ -1657,9 +1695,11 @@ if [ -s enum/web/live-web-urls.txt ]; then
         run_ferox_plan "$URL" "$SAFE_URL" "$WORDLIST_PLAN" "$WEB_EXTENSIONS"
         run_ffuf_content_plan "$URL" "$SAFE_URL" "$WORDLIST_PLAN" "$WEB_EXTENSIONS" "$TECH_PROFILE"
         run_vhost_ffuf "$URL" "$SAFE_URL"
-        run_cms_specific_checks "$URL" "$SAFE_URL" "$TECH_PROFILE"
+        if [[ "$WEB_ENUM" == "1" ]]; then
+            run_cms_specific_checks "$URL" "$SAFE_URL" "$TECH_PROFILE"
+        fi
 
-        if have nikto; then
+        if [[ "$WEB_ENUM" == "1" ]] && have nikto; then
             echo "[+] Running nikto"
             nikto -h "$URL" -output "enum/web/nikto-$SAFE_URL.txt" || true
         fi
@@ -1672,10 +1712,7 @@ if [ -s enum/web/live-web-urls.txt ]; then
             nmap --script ssl-cert,ssl-enum-ciphers -Pn -p "$PORT" "$IP" -oN "enum/web/nmap-ssl-$SAFE_URL.txt" || true
         fi
 
-        if have nuclei; then
-            echo "[+] Running nuclei"
-            nuclei -u "$URL" -severity low,medium,high,critical -o "enum/web/nuclei-$SAFE_URL.txt" || true
-        fi
+        # Broad Nuclei/DAST assessment runs once after hostname discovery below.
     done < enum/web/live-web-urls.txt
 else
     echo "[-] No web services detected."
@@ -1742,6 +1779,30 @@ else
     echo "[-] DNS port not detected."
     extract_dns_hostnames
     probe_discovered_hostnames
+fi
+
+echo
+echo "=============================="
+echo "[+] Web application assessment"
+echo "=============================="
+
+if [[ "$WEB_ASSESS" == "1" ]] && { [[ -s enum/web/live-web-urls.txt ]] || [[ -s enum/web/discovered-host-web-urls.txt ]]; }; then
+    if [[ -f ./web-assess.sh && -f ./web-assess.py ]]; then
+        if bash ./web-assess.sh; then
+            echo "[+] Automated web assessment finished; review its coverage limits."
+        else
+            WEB_ASSESS_STATUS=$?
+            if [[ "$WEB_ASSESS_STATUS" == "1" ]]; then
+                echo "[!] Web assessment produced findings; see enum/web/assessments/."
+            else
+                echo "[!] Web assessment incomplete (exit $WEB_ASSESS_STATUS); inspect its report/logs."
+            fi
+        fi
+    else
+        echo "[!] Web assessment helper missing; initialize using the full repository checkout."
+    fi
+else
+    echo "[i] Web assessment disabled or no web URLs discovered."
 fi
 
 echo
@@ -1944,14 +2005,16 @@ echo "[+] 17. Optional vulnerability Nmap scan"
 echo "========================================="
 
 echo "[+] This scan can be slow/noisy. Treat results as hints."
-nmap --script vuln -Pn -p "$PORTS" "$IP" -oN scans/tcp-vuln.txt || true
+# NSE does not reuse version/CPE information from the earlier invocation.
+# Scripts such as vulners require -sV in this scan to perform online matching.
+nmap -sV --script vuln -Pn -p "$PORTS" "$IP" -oN scans/tcp-vuln.txt -oX scans/tcp-vuln.xml || true
 
 echo
 echo "=============================="
 echo "[+] 18. Interesting grep"
 echo "=============================="
 
-grep -RniI \
+grep -RniIE \
     --exclude="interesting-grep.txt" \
     --exclude="summary.md" \
     --exclude="recon-console.log" \
@@ -2038,7 +2101,7 @@ echo "=============================="
     echo
     echo "## Interesting Web Headers"
     echo
-    grep -RniI \
+    grep -RniIE \
         --exclude="*.map" \
         --exclude="*tailwind*" \
         --exclude="*polyfills*" \
@@ -2240,6 +2303,8 @@ less summary.md
 * notes.md - working notes
 * writeup.md - final report/writeup
 * recon.sh - automated first-stage recon
+* web-assess.sh - bounded HTTP template and query DAST checks, plus OWASP review checklist
+* enum/web/assessments/ - independent web assessment runs, findings and stage logs
 * search-recon.sh - search collected recon and optionally copy matched files
 * file-hunt.sh - find readable files by name pattern and copy matches to loot
 * update-hosts.sh - update /etc/hosts for this box
@@ -2276,7 +2341,11 @@ Default recon is conservative to avoid ffuf/ferox loops on dynamic targets.
 ./recon.sh
 
 # Disable all heavy web fuzzing
-WEB_ENUM=0 ./recon.sh
+WEB_ENUM=0 WEB_ASSESS=0 ./recon.sh
+
+# Run web assessment independently; preview targets without network access
+./web-assess.sh --dry-run
+./web-assess.sh --insecure --oast
 
 # Run ferox but without extension multiplication or collect-backups
 FEROX_EXTENSIONS=0 FEROX_COLLECT=0 ./recon.sh

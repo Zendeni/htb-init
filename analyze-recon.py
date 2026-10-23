@@ -65,9 +65,8 @@ FORM_ACTION_RE = re.compile(r"""<form[^>]+action=["']?([^"'\s>]+)""", re.IGNOREC
 INPUT_RE = re.compile(r"""<input[^>]+(?:name|id)=["']?([^"'\s>]+)""", re.IGNORECASE)
 SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
 LINK_HREF_RE = re.compile(r"""<a[^>]+href=["']([^"']+)["']""", re.IGNORECASE)
-PORT_TABLE_RE = re.compile(r"^\|\s*(\d+)\s*\|\s*([^\n|]+?)\s*\|\s*([^\n|]*?)\s*\|", re.MULTILINE)
 NMAP_OPEN_RE = re.compile(
-    r"^(\d+)/(tcp|udp)[^\S\r\n]+open[^\S\r\n]+(\S+)(?:[^\S\r\n]+([^\r\n]*))?$",
+    r"^(\d+)/(tcp|udp)[^\S\r\n]+open[^\S\r\n]+(\S+)(?:[^\S\r\n]+([^\r\n]*))?\r?$",
     re.MULTILINE,
 )
 HOST_LINE_RE = re.compile(r"^\s*HOST=\"?([^\"\n]+)\"?\s*$", re.MULTILINE)
@@ -258,7 +257,7 @@ class ReconData:
     box: str = ""
     ip: str = ""
     host: str = ""
-    ports: dict[int, Port] = field(default_factory=dict)
+    ports: dict[tuple[int, str], Port] = field(default_factory=dict)
     files: dict[str, str] = field(default_factory=dict)
     web_urls: set[str] = field(default_factory=set)
     technologies: set[str] = field(default_factory=set)
@@ -505,11 +504,14 @@ def parse_target_env(data: ReconData) -> None:
 def add_port(data: ReconData, num: int, service: str, version: str = "", proto: str = "tcp") -> None:
     service = service.strip()
     version = version.strip()
-    proto = proto.strip() or "tcp"
+    proto = proto.strip().lower() or "tcp"
+    if not 1 <= num <= 65535 or proto not in {"tcp", "udp"}:
+        return
 
-    existing = data.ports.get(num)
+    key = (num, proto)
+    existing = data.ports.get(key)
     if not existing:
-        data.ports[num] = Port(num, service, version, proto)
+        data.ports[key] = Port(num, service, version, proto)
         return
 
     if service and not existing.service:
@@ -542,7 +544,7 @@ def infer_tech_from_ports(data: ReconData) -> None:
     "possible Zabbix" from 10050/10051 even when Nmap reports tcpwrapped.
     """
     for port_no, rule in PORT_TECH_RULES.items():
-        port = data.ports.get(port_no)
+        port = data.ports.get((port_no, "tcp"))
         if not port:
             continue
 
@@ -702,10 +704,6 @@ def parse_ports(data: ReconData) -> None:
 
         for line in text.splitlines():
             parse_markdown_port_table_line(data, line)
-
-        for num, service, version in PORT_TABLE_RE.findall(text):
-            if num.isdigit():
-                add_port(data, int(num), service, version)
 
         for num, proto, service, version in NMAP_OPEN_RE.findall(text):
             if num.isdigit():
@@ -1149,6 +1147,8 @@ def parse_web(data: ReconData) -> None:
 
 def normalize_web_ports(data: ReconData) -> None:
     for port in list(data.ports.values()):
+        if port.proto != "tcp":
+            continue
         port_s = str(port.number)
         seen_in_url = any(f":{port_s}" in url for url in data.web_urls)
 
@@ -1268,17 +1268,23 @@ def parse_package_files(data: ReconData) -> None:
                 obj = json.loads(text)
             except Exception:
                 continue
+            if not isinstance(obj, dict):
+                continue
             for block in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
                 deps = obj.get(block, {})
                 if isinstance(deps, dict):
                     for pkg, ver in deps.items():
-                        ver = str(ver).strip().lstrip("^~>=< ")
-                        if re.match(r"\d+\.\d+", ver):
+                        # A manifest constraint is not an observed installed
+                        # version. Only a complete exact semver may feed OSV.
+                        ver = str(ver).strip()
+                        if re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", ver):
                             add_package(data, "npm", pkg, ver)
         elif name in {"package-lock.json", "npm-shrinkwrap.json"}:
             try:
                 obj = json.loads(text)
             except Exception:
+                continue
+            if not isinstance(obj, dict):
                 continue
             packages = obj.get("packages", {})
             if isinstance(packages, dict):
@@ -1288,8 +1294,11 @@ def parse_package_files(data: ReconData) -> None:
                     version = str(meta.get("version", "")).strip()
                     if not version:
                         continue
-                    if pkg_path.startswith("node_modules/"):
-                        pkg = pkg_path[len("node_modules/"):]
+                    if pkg_path.startswith("node_modules/") or "/node_modules/" in pkg_path:
+                        # npm lockfile keys are installation paths, including
+                        # nested dependencies and workspace installations. OSV
+                        # needs the registry name (with its optional @scope).
+                        pkg = pkg_path.rsplit("node_modules/", 1)[1]
                         add_package(data, "npm", pkg, version)
             deps = obj.get("dependencies", {})
             if isinstance(deps, dict):
@@ -1308,6 +1317,8 @@ def parse_package_files(data: ReconData) -> None:
             try:
                 obj = json.loads(text)
             except Exception:
+                continue
+            if not isinstance(obj, dict):
                 continue
             for block in ("packages", "packages-dev"):
                 for meta in obj.get(block, []) if isinstance(obj.get(block, []), list) else []:
@@ -1612,6 +1623,11 @@ def run_osv_lookup(data: ReconData, cache: dict, timeout: int = 20) -> list[Vuln
     queries = []
     for key, versions in sorted(data.package_versions.items()):
         ecosystem, name = key.split(":", 1)
+        # Generic banner-derived products are NVD keyword candidates, not
+        # packages in an OSV ecosystem. Do not invalidate an otherwise useful
+        # batch by mixing them with actual package-manager coordinates.
+        if ecosystem.lower() == "generic":
+            continue
         if ecosystem.lower() == "npm":
             osv_ecosystem = "npm"
         else:
@@ -1873,7 +1889,8 @@ def preferred_web_base(data: ReconData) -> str:
                 return url.rstrip("/")
         return urls[0].rstrip("/")
 
-    ports = set(data.ports)
+    tcp_ports = {p.number: p for p in data.ports.values() if p.proto == "tcp"}
+    ports = set(tcp_ports)
     host = target_name(data)
 
     if 443 in ports:
@@ -1884,7 +1901,7 @@ def preferred_web_base(data: ReconData) -> str:
         return f"http://{host}:3000"
 
     for port in sorted(ports):
-        service = data.ports[port].service.lower()
+        service = tcp_ports[port].service.lower()
         if "http" in service or port in {5000, 8000, 8080, 8443, 9000, 9090, 10000}:
             scheme = "https" if port == 8443 else "http"
             return f"{scheme}://{host}:{port}"
@@ -1894,7 +1911,7 @@ def preferred_web_base(data: ReconData) -> str:
 
 def detect_profile(data: ReconData) -> list[str]:
     profiles = []
-    ports = set(data.ports)
+    ports = {p.number for p in data.ports.values() if p.proto == "tcp"}
     tech = " ".join(sorted(data.technologies)).lower()
 
     if {88, 389, 445}.issubset(ports) or "active directory" in tech:
@@ -1926,7 +1943,7 @@ def detect_profile(data: ReconData) -> list[str]:
 
 def build_findings(data: ReconData) -> list[Finding]:
     findings: list[Finding] = []
-    ports = set(data.ports)
+    ports = {p.number for p in data.ports.values() if p.proto == "tcp"}
     tech = " ".join(sorted(data.technologies)).lower()
     endpoints_low = {endpoint.lower() for endpoint in data.endpoints}
     shares_low = {share.lower() for share in data.smb_shares}
@@ -2207,14 +2224,14 @@ def build_findings(data: ReconData) -> list[Finding]:
             "SSH exposed",
             "SSH is exposed. Prioritize credential reuse only after finding users/passwords from other services.",
             "low",
-            evidence=[f"Version: {data.ports[22].version or data.ports[22].service}"],
+            evidence=[f"Version: {data.ports[(22, 'tcp')].version or data.ports[(22, 'tcp')].service}"],
             commands=[
                 f"netexec ssh {target_ip(data)} -u users.txt -p '<password>'",
                 f"ssh <user>@{target_ip(data)}",
             ],
         ))
 
-    if 53 in ports:
+    if 53 in ports or (53, "udp") in data.ports:
         domain = data.host or data.domain or "<domain>"
         findings.append(Finding(
             "DNS service exposed",

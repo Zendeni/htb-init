@@ -134,6 +134,85 @@ Reports retain source locations and hashes, and redact common secret patterns. R
 
 Changes between reports describe differences in supplied evidence. A removed finding can reflect changed collection or parser coverage and does not by itself prove remediation.
 
+## Web application assessment
+
+New workspaces include `web-assess.sh` and `web-assess.py`. Use the full checkout
+when initializing: the Python helper must sit beside `htb-init.sh` to be copied.
+Existing workspaces can use `python3 /path/to/htb-init/web-assess.py --workspace /path/to/workspace`.
+This is an **active** collection step, separate from offline ScopeLens review.
+Running `recon.sh` starts it after web/vhost discovery; `WEB_ASSESS=0` disables it.
+
+Install [ProjectDiscovery Nuclei](https://docs.projectdiscovery.io/opensource/nuclei/install)
+and its signed community templates before running the collector:
+
+```bash
+nuclei -version
+nuclei -update-templates
+# The helper uses ~/nuclei-templates by default; override with --templates.
+./web-assess.sh --dry-run
+./web-assess.sh
+```
+
+The script reads `enum/web/live-web-urls.txt` and
+`enum/web/discovered-host-web-urls.txt`, validates explicit scope, performs a
+bounded same-origin HTML crawl, and runs two distinct Nuclei stages:
+
+- Signed HTTP templates for known XSS, XXE, SSRF, CVEs, exposed files, CORS,
+  misconfiguration and other checks present in the installed template set.
+- DAST templates against query parameters discovered in links and GET forms,
+  or supplied in an endpoint list. DAST must be enabled explicitly in Nuclei;
+  the helper supplies `-dast` automatically.
+
+It saves the selected template inventory, commands, JSONL findings, logs,
+`report.json` and `report.md` in a fresh `enum/web/assessments/<run>/` directory.
+No templates, missing tools, timeouts, malformed findings and failed stages are
+reported as incomplete. Exit codes: `0` completed/planned, `1` findings, `2`
+invalid or incomplete assessment, `130` interrupted. A completed run describes
+the selected automation only; skipped checks and the manual checklist remain.
+
+```bash
+# Review discovered scope before scanning. scope.json exclusions always win.
+./web-assess.sh --dry-run
+# Include a discovered vhost explicitly; ensure it resolves to the lab IP.
+./web-assess.sh --allow-host app.example.htb --url 'http://app.example.htb:8080/'
+# Supply parameterized URLs or a newline-delimited endpoint list.
+./web-assess.sh --url 'http://example.htb/search?q=test'
+./web-assess.sh --urls-file endpoints.txt --no-crawl
+# Allow lab self-signed TLS for the crawler; enable blind callback tests.
+./web-assess.sh --insecure --oast
+# Tune request volume and deadlines.
+./web-assess.sh --rate-limit 5 --concurrency 1 --max-pages 20 --scan-timeout 1800
+```
+
+`scope.json` is authoritative when present; otherwise literal `IP` and `HOST`
+values in `.target.env` establish scope without sourcing shell code. This
+collector requires nonempty included scope, unlike the offline evidence filter.
+`--allow-host` adds exact names/IPs; wildcard/suffix matching is not implicit.
+Automatic URL lists skip excluded/unknown hosts with diagnostics; explicit
+out-of-scope inputs fail. Explicit URL options replace the discovery lists.
+Redirects are disabled in Nuclei, and the crawler follows only included origins.
+Templates are trusted scanner code: this is target filtering, not a network
+sandbox. Update your trusted template checkout separately; scans do not request
+updates. The generated empty config prevents user defaults changing the plan.
+
+Defaults: 10 requests/second, 2 concurrent templates, 30 crawl pages, 200
+endpoints, 120 seconds for crawling, 900 seconds per scan stage. The crawler
+does not submit forms or render JavaScript; discovered query endpoints are
+passed to DAST. Nuclei handles its own TLS validation behavior; `--insecure`
+controls only the Python crawler. `--no-crawl` and `--no-dast` disable those steps.
+DoS/brute-force and headless/code checks are excluded. OAST is off by default;
+`--oast` enables Interactsh callbacks, including public callback infrastructure.
+Blind SSRF/XXE checks need callback connectivity from the target.
+
+**Coverage is partial, never a full OWASP certification.** Each report contains
+an [OWASP Top 10:2025](https://owasp.org/Top10/2025/) manual checklist. Known XXE
+templates can test specific products, but arbitrary XML bodies need captured
+requests and parser-specific testing. POST/JSON body fuzzing, stored/DOM XSS,
+authenticated authorization/IDOR, session logic, business rules, supply-chain
+integrity, cryptography at rest and server-side logging need additional review.
+Use Burp/ZAP with representative requests/accounts for those paths. The report
+keeps these gaps visible even when no automated finding is returned.
+
 ## Earlier workflow
 
 The existing collection scripts and `analyze-recon.py` remain available. ScopeLens is the shared reporting path described above. The [original workflow documentation](docs/legacy-workflow.md) is retained as a historical reference for existing users; its analyzer and command options are separate from ScopeLens.
