@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+INIT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
     cat <<'USAGE'
 Usage:
@@ -130,6 +132,11 @@ echo "[+] Workspace: $BASE_DIR"
 mkdir -p "$BASE_DIR"/{scans,enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other},loot/{copied,searches},exploits,shells,screenshots,tools}
 cd "$BASE_DIR"
 BASE_DIR="$PWD"
+
+if [ -f "$INIT_SOURCE_DIR/analyze-recon.py" ] && [ ! -L "$INIT_SOURCE_DIR/analyze-recon.py" ]; then
+    cp -- "$INIT_SOURCE_DIR/analyze-recon.py" tools/analyze-recon.py
+    chmod +x tools/analyze-recon.py
+fi
 
 cat > .target.env <<EOF
 BOX="$BOX"
@@ -428,7 +435,7 @@ fi
 echo "[+] Creating recon archive: $OUTFILE"
 
 REVIEW_FILES=()
-for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md; do
+for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md recon-analysis.md tools/analyze-recon.py; do
     if [[ -f "$REVIEW_FILE" && ! -L "$REVIEW_FILE" ]]; then
         REVIEW_FILES+=("$REVIEW_FILE")
     fi
@@ -573,6 +580,8 @@ source ./.target.env
 exec > >(tee -a recon-console.log) 2>&1
 
 START_TIME="$(date)"
+START_EPOCH="$(date +%s)"
+TOTAL_STAGES=21
 
 # Runtime safety knobs. Defaults are intentionally conservative so recon does not
 # appear to hang in ffuf/ferox sections on dynamic or slow web targets.
@@ -581,6 +590,7 @@ START_TIME="$(date)"
 #   WEB_ENUM=0 ./recon.sh
 #   FEROX_EXTENSIONS=0 FEROX_COLLECT=0 ./recon.sh
 #   RECON_DEEP=1 FEROX_EXTENSIONS=1 FEROX_COLLECT=1 FFUF_CONTENT=1 ./recon.sh
+#   ONLINE_VULN_CHECK=0 ./recon.sh
 RECON_DEEP="${RECON_DEEP:-0}"
 WEB_ENUM="${WEB_ENUM:-1}"
 FEROX_ENABLE="${FEROX_ENABLE:-1}"
@@ -593,12 +603,101 @@ FFUF_RATE="${FFUF_RATE:-50}"
 FFUF_MAXTIME="${FFUF_MAXTIME:-180}"
 FEROX_MAXTIME="${FEROX_MAXTIME:-240}"
 FEROX_THREADS="${FEROX_THREADS:-10}"
+NIKTO_MAXTIME="${NIKTO_MAXTIME:-600}"
+NUCLEI_MAXTIME="${NUCLEI_MAXTIME:-600}"
+WEB_DAST="${WEB_DAST:-1}"
+DAST_MAXTIME="${DAST_MAXTIME:-300}"
+DAST_RATE="${DAST_RATE:-20}"
+DAST_MAX_INPUTS="${DAST_MAX_INPUTS:-100}"
+MAX_DAST_TARGETS="${MAX_DAST_TARGETS:-1}"
+WAPITI_MAXTIME="${WAPITI_MAXTIME:-300}"
+WAPITI_MODULES="${WAPITI_MODULES:-exec,file,permanentxss,redirect,sql,ssrf,upload,xss,xxe,crlf,csrf,ldap,methods}"
+SCANNER_UPDATE_MAXTIME="${SCANNER_UPDATE_MAXTIME:-180}"
+UPDATE_SCANNER_DATA="${UPDATE_SCANNER_DATA:-1}"
+NMAP_MAXTIME="${NMAP_MAXTIME:-900}"
+SERVICE_ENUM_MAXTIME="${SERVICE_ENUM_MAXTIME:-300}"
+WEB_PROBE_MAXTIME="${WEB_PROBE_MAXTIME:-120}"
+CURL_MAXTIME="${CURL_MAXTIME:-20}"
+ANALYZER_MAXTIME="${ANALYZER_MAXTIME:-900}"
+ARCHIVE_MAXTIME="${ARCHIVE_MAXTIME:-300}"
 MAX_WEB_URLS="${MAX_WEB_URLS:-4}"
 MAX_WEB_WORDLISTS="${MAX_WEB_WORDLISTS:-1}"
 MAX_FFUF_WORDLISTS="${MAX_FFUF_WORDLISTS:-1}"
+VHOST_SUFFIXES="${VHOST_SUFFIXES:-htb,vl,local}"
+ONLINE_VULN_CHECK="${ONLINE_VULN_CHECK:-1}"
+VULN_ANALYZER="${VULN_ANALYZER:-}"
+VULN_TIMEOUT="${VULN_TIMEOUT:-20}"
+MAX_VULN_RESULTS="${MAX_VULN_RESULTS:-8}"
 
 have() {
     command -v "$1" >/dev/null 2>&1
+}
+
+format_elapsed() {
+    local elapsed="$1"
+    printf '%02d:%02d:%02d' "$((elapsed / 3600))" "$(((elapsed % 3600) / 60))" "$((elapsed % 60))"
+}
+
+show_progress() {
+    local current="$1"
+    local label="$2"
+    local now elapsed completed percent
+
+    now="$(date +%s)"
+    elapsed="$((now - START_EPOCH))"
+    completed="$((current - 1))"
+    [ "$completed" -ge 0 ] || completed=0
+    percent="$((completed * 100 / TOTAL_STAGES))"
+    printf '[+] Progress: %3d%% | elapsed %s | stage %d/%d: %s\n' \
+        "$percent" "$(format_elapsed "$elapsed")" "$current" "$TOTAL_STAGES" "$label"
+}
+
+find_vuln_analyzer() {
+    local candidate
+
+    for candidate in \
+        "$VULN_ANALYZER" \
+        "$SCRIPT_DIR/tools/analyze-recon.py" \
+        "/home/zendeni/tools/htb/analyze-recon.py"; do
+        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if have analyze-recon.py; then
+        command -v analyze-recon.py
+        return 0
+    fi
+
+    return 1
+}
+
+run_online_vuln_analysis() {
+    local analyzer
+
+    if [ "$ONLINE_VULN_CHECK" != "1" ]; then
+        echo "[!] Skipping OSV/NVD enrichment because ONLINE_VULN_CHECK=$ONLINE_VULN_CHECK."
+        return 0
+    fi
+
+    if ! have python3; then
+        echo "[!] Skipping OSV/NVD enrichment: python3 is not installed."
+        return 0
+    fi
+
+    analyzer="$(find_vuln_analyzer || true)"
+    if [ -z "$analyzer" ]; then
+        echo "[!] Skipping OSV/NVD enrichment: analyze-recon.py was not found."
+        echo "[!] Set VULN_ANALYZER=/path/to/analyze-recon.py and rerun recon."
+        return 0
+    fi
+
+    echo "[+] Querying OSV and NVD with $analyzer"
+    run_with_timeout "$ANALYZER_MAXTIME" python3 "$analyzer" "$SCRIPT_DIR" \
+        --online-vuln-check \
+        --vuln-timeout "$VULN_TIMEOUT" \
+        --max-vuln-results "$MAX_VULN_RESULTS" || true
 }
 
 ports_lines() {
@@ -649,11 +748,31 @@ is_hostname_candidate() {
     return 0
 }
 
+is_vhost_base_candidate() {
+    local name="$1"
+    local suffix
+    local -a allowed_suffixes
+
+    [ "$name" = "${HOST,,}" ] && return 0
+
+    IFS=',' read -r -a allowed_suffixes <<< "$VHOST_SUFFIXES"
+    for suffix in "${allowed_suffixes[@]}"; do
+        suffix="${suffix//[[:space:]]/}"
+        suffix="${suffix#.}"
+        if [ -n "$suffix" ] && [[ "$name" == *."$suffix" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 record_vhost_base_domain() {
     local name="$1"
 
     name="$(printf '%s' "$name" | sed 's/[[:space:]]//g; s/:$//; s/^\.//; s/\.$//' | tr '[:upper:]' '[:lower:]')"
     is_hostname_candidate "$name" || return 0
+    is_vhost_base_candidate "$name" || return 0
     mkdir -p enum/dns
     append_unique_line "$name" enum/dns/vhost-base-domains.txt
 }
@@ -706,12 +825,50 @@ truncate_lines() {
 
 run_with_timeout() {
     local seconds="$1"
+    local status
     shift
 
-    if have timeout; then
-        timeout "$seconds" "$@"
+    if ! have timeout; then
+        echo "[-] timeout is required to run bounded commands safely." >&2
+        return 127
+    fi
+
+    if timeout --signal=TERM --kill-after=10 "$seconds" "$@"; then
+        return 0
     else
-        "$@"
+        status="$?"
+    fi
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+        echo "[!] Command exceeded ${seconds}s and was terminated: $1" >&2
+    else
+        echo "[!] Command exited with status $status: $1" >&2
+    fi
+    return "$status"
+}
+
+refresh_scanner_data() {
+    if [ "$UPDATE_SCANNER_DATA" != "1" ]; then
+        echo "[!] Skipping scanner-data refresh because UPDATE_SCANNER_DATA=$UPDATE_SCANNER_DATA."
+        return 0
+    fi
+
+    if have nuclei; then
+        echo "[+] Updating Nuclei templates before scanning."
+        run_with_timeout "$SCANNER_UPDATE_MAXTIME" nuclei -update-templates || true
+    fi
+
+    if have nmap; then
+        echo "[+] Rebuilding Nmap's local NSE script database."
+        run_with_timeout "$SCANNER_UPDATE_MAXTIME" nmap --script-updatedb || true
+    fi
+
+    if have wapiti; then
+        echo "[+] Updating Wapiti attack modules before active DAST."
+        run_with_timeout "$SCANNER_UPDATE_MAXTIME" wapiti --update || true
+    fi
+
+    if have nikto; then
+        echo "[+] Nikto will perform its built-in update check when its scan starts."
     fi
 }
 
@@ -1130,13 +1287,19 @@ run_cms_specific_checks() {
         echo "[+] Drupal profile detected; checking Drupal-specific paths and scanners."
         for path in CHANGELOG.txt core/CHANGELOG.txt user/login user/register node sites/default/files/ sites/default/settings.php; do
             safe_path="$(echo "$path" | sed 's#[/]#_#g')"
-            curl -k -s -i "$url/$path" -o "enum/web/drupal-$safe_path-$safe_url.txt" || true
+            curl -k -s -i --connect-timeout 5 --max-time "$CURL_MAXTIME" \
+                "$url/$path" -o "enum/web/drupal-$safe_path-$safe_url.txt" || true
         done
         if have droopescan; then
             run_with_timeout 900 droopescan scan drupal -u "$url" | tee "enum/web/droopescan-$safe_url.txt" || true
         fi
         if have nuclei; then
-            nuclei -u "$url" -tags drupal,cms -severity low,medium,high,critical -o "enum/web/nuclei-drupal-$safe_url.txt" || true
+            run_with_timeout "$NUCLEI_MAXTIME" nuclei \
+                -u "$url" \
+                -tags drupal,cms \
+                -severity low,medium,high,critical \
+                -duc \
+                -o "enum/web/nuclei-drupal-$safe_url.txt" || true
         fi
     fi
 
@@ -1154,8 +1317,106 @@ run_cms_specific_checks() {
         echo "[+] API indicators detected; checking common API docs and GraphQL paths."
         for path in api api/v1 api/v2 graphql graphiql swagger swagger-ui openapi.json swagger.json docs redoc; do
             safe_path="$(echo "$path" | sed 's#[/]#_#g')"
-            curl -k -s -i "$url/$path" -o "enum/web/api-$safe_path-$safe_url.txt" || true
+            curl -k -s -i --connect-timeout 5 --max-time "$CURL_MAXTIME" \
+                "$url/$path" -o "enum/web/api-$safe_path-$safe_url.txt" || true
         done
+    fi
+}
+
+build_dast_input_file() {
+    local url="$1"
+    local safe_url="$2"
+    local output_file="$3"
+    local candidate file tmp_file
+
+    : > "$output_file"
+    append_unique_line "$url" "$output_file"
+
+    for file in enum/web/ferox-"$safe_url"-*.txt; do
+        [ -f "$file" ] || continue
+        while read -r candidate; do
+            case "$candidate" in
+                "$url"*) append_unique_line "$candidate" "$output_file" ;;
+            esac
+        done < <(grep -Eo 'https?://[^][(){}<>"[:space:]]+' "$file" 2>/dev/null || true)
+    done
+
+    if have jq; then
+        for file in enum/web/ffuf-content-"$safe_url"-*.json; do
+            [ -f "$file" ] || continue
+            while read -r candidate; do
+                case "$candidate" in
+                    "$url"*) append_unique_line "$candidate" "$output_file" ;;
+                esac
+            done < <(jq -r '.results[]?.url // empty' "$file" 2>/dev/null || true)
+        done
+    fi
+
+    tmp_file="$(mktemp)"
+    head -n "$DAST_MAX_INPUTS" "$output_file" > "$tmp_file"
+    mv "$tmp_file" "$output_file"
+}
+
+run_web_dast() {
+    local url="$1"
+    local safe_url="$2"
+    local target_number="$3"
+    local input_file="enum/web/dast-inputs-$safe_url.txt"
+    local wapiti_scan_time
+
+    if [ "$WEB_DAST" != "1" ]; then
+        echo "[!] Skipping active web DAST because WEB_DAST=$WEB_DAST."
+        return 0
+    fi
+
+    if [ "$target_number" -gt "$MAX_DAST_TARGETS" ]; then
+        echo "[!] DAST target budget reached at MAX_DAST_TARGETS=$MAX_DAST_TARGETS; skipping $url."
+        return 0
+    fi
+
+    build_dast_input_file "$url" "$safe_url" "$input_file"
+    echo "[+] Active web DAST inputs: $(wc -l < "$input_file" | tr -d ' ')"
+
+    if have nuclei; then
+        echo "[+] Running bounded Nuclei DAST (low fuzzing aggression)."
+        run_with_timeout "$DAST_MAXTIME" nuclei \
+            -l "$input_file" \
+            -H "Host: $HOST" \
+            -dast \
+            -fa low \
+            -rl "$DAST_RATE" \
+            -severity low,medium,high,critical \
+            -duc \
+            -o "enum/web/nuclei-dast-$safe_url.txt" || true
+    fi
+
+    if have wapiti; then
+        echo "[+] Running bounded Wapiti DAST modules: $WAPITI_MODULES"
+        wapiti_scan_time="$WAPITI_MAXTIME"
+        if [[ "$WAPITI_MAXTIME" =~ ^[0-9]+$ ]] && [ "$WAPITI_MAXTIME" -gt 30 ]; then
+            wapiti_scan_time="$((WAPITI_MAXTIME - 30))"
+        fi
+        run_with_timeout "$WAPITI_MAXTIME" wapiti \
+            -u "$url" \
+            -H "Host: $HOST" \
+            --scope folder \
+            --headless no \
+            --flush-session \
+            --store-session "enum/web/wapiti-session-$safe_url" \
+            --store-config "enum/web/wapiti-config-$safe_url" \
+            --max-scan-time "$wapiti_scan_time" \
+            --max-attack-time 45 \
+            --max-links-per-page 50 \
+            --max-files-per-dir 100 \
+            --max-parameters 20 \
+            --tasks 4 \
+            -S polite \
+            -t "$CURL_MAXTIME" \
+            -m "$WAPITI_MODULES" \
+            -f json \
+            -o "enum/web/wapiti-$safe_url.json" \
+            --no-bugreport \
+            -v 1 || true
     fi
 }
 
@@ -1367,20 +1628,23 @@ SNMP_WORDLIST="$(pick_first_file \
     || true)"
 
 mkdir -p scans enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,ssh,other}
+: > scans/tcp-full.txt
+: > scans/tcp-services.txt
+: > scans/udp-top100.txt
 : > enum/dns/vhost-base-domains.txt
 append_unique_line "$HOST" enum/dns/vhost-base-domains.txt
 
 echo "[+] Starting recon for $BOX / $IP"
 echo "[+] Hostname: $HOST"
 echo "[+] Started at: $START_TIME"
-echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS"
+echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE NIKTO_MAXTIME=$NIKTO_MAXTIME NUCLEI_MAXTIME=$NUCLEI_MAXTIME WEB_DAST=$WEB_DAST DAST_MAXTIME=$DAST_MAXTIME DAST_RATE=$DAST_RATE MAX_DAST_TARGETS=$MAX_DAST_TARGETS WAPITI_MAXTIME=$WAPITI_MAXTIME NMAP_MAXTIME=$NMAP_MAXTIME SERVICE_ENUM_MAXTIME=$SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME=$WEB_PROBE_MAXTIME CURL_MAXTIME=$CURL_MAXTIME ANALYZER_MAXTIME=$ANALYZER_MAXTIME ARCHIVE_MAXTIME=$ARCHIVE_MAXTIME UPDATE_SCANNER_DATA=$UPDATE_SCANNER_DATA SCANNER_UPDATE_MAXTIME=$SCANNER_UPDATE_MAXTIME MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS VHOST_SUFFIXES=$VHOST_SUFFIXES ONLINE_VULN_CHECK=$ONLINE_VULN_CHECK VULN_TIMEOUT=$VULN_TIMEOUT MAX_VULN_RESULTS=$MAX_VULN_RESULTS"
 
 echo
 echo "=============================="
 echo "[+] 0. Tool availability check"
 echo "=============================="
 
-for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
+for TOOL in nmap timeout whatweb feroxbuster ffuf nikto wapiti curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
     if have "$TOOL"; then
         echo "[+] $TOOL found"
     else
@@ -1388,8 +1652,15 @@ for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobust
     fi
 done | tee scans/tool-check.txt
 
-if ! have nmap; then
-    echo "[-] nmap is required."
+echo
+echo "================================"
+echo "[+] 0.5 Scanner-data refresh"
+echo "================================"
+
+refresh_scanner_data
+
+if ! have nmap || ! have timeout; then
+    echo "[-] nmap and timeout are required."
     exit 1
 fi
 
@@ -1424,16 +1695,23 @@ echo
 echo "=============================="
 echo "[+] 1. TCP full port discovery"
 echo "=============================="
+show_progress 1 "TCP full port discovery"
 
-nmap -p- --min-rate 5000 -Pn "$IP" -oN scans/tcp-full.txt
+TCP_DISCOVERY_STATUS=0
+run_with_timeout "$NMAP_MAXTIME" nmap \
+    -p- --min-rate 5000 -Pn "$IP" -oN scans/tcp-full.txt || TCP_DISCOVERY_STATUS=$?
 
 PORTS="$(grep -oP '^\d+/tcp\s+open' scans/tcp-full.txt | cut -d/ -f1 | paste -sd, - || true)"
 
 if [ -z "$PORTS" ]; then
     echo "[-] No open TCP ports found."
+    if [ "$TCP_DISCOVERY_STATUS" -ne 0 ]; then
+        echo "[!] TCP discovery exited with status $TCP_DISCOVERY_STATUS; its result may be incomplete."
+    fi
     echo "[+] Continuing with UDP top ports scan only."
 
-    nmap -sU -Pn --top-ports 100 "$IP" -oN scans/udp-top100.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        -sU -Pn --top-ports 100 "$IP" -oN scans/udp-top100.txt || true
 
     {
         echo "# Recon Summary - $BOX"
@@ -1452,10 +1730,12 @@ if [ -z "$PORTS" ]; then
         echo "Verify HTB instance state, target IP, and VPN routing."
     } > summary.md
 
-    if ! ./zip-recon.sh; then
+    if ! run_with_timeout "$ARCHIVE_MAXTIME" ./zip-recon.sh; then
         echo "[!] WARNING: Recon archive creation failed."
     fi
 
+    END_EPOCH="$(date +%s)"
+    echo "[+] Progress: 100% | elapsed $(format_elapsed "$((END_EPOCH - START_EPOCH))") | early completion (no TCP ports discovered)"
     exit 0
 fi
 
@@ -1466,22 +1746,29 @@ echo
 echo "======================================"
 echo "[+] 2. TCP service/version enumeration"
 echo "======================================"
+show_progress 2 "TCP service/version enumeration"
 
-nmap -sC -sV -Pn -p "$PORTS" "$IP" -oN scans/tcp-services.txt
-nmap -A -Pn -p "$PORTS" "$IP" -oN scans/tcp-aggressive.txt || true
-nmap --script default,safe -Pn -p "$PORTS" "$IP" -oN scans/tcp-default-safe-scripts.txt || true
+run_with_timeout "$NMAP_MAXTIME" nmap \
+    -sC -sV -Pn -p "$PORTS" "$IP" -oN scans/tcp-services.txt || true
+run_with_timeout "$NMAP_MAXTIME" nmap \
+    -A -Pn -p "$PORTS" "$IP" -oN scans/tcp-aggressive.txt || true
+run_with_timeout "$NMAP_MAXTIME" nmap \
+    --script default,safe -Pn -p "$PORTS" "$IP" -oN scans/tcp-default-safe-scripts.txt || true
 
 echo
 echo "=============================="
 echo "[+] 3. UDP top ports scan"
 echo "=============================="
+show_progress 3 "UDP top ports scan"
 
-nmap -sU -Pn --top-ports 100 "$IP" -oN scans/udp-top100.txt || true
+run_with_timeout "$NMAP_MAXTIME" nmap \
+    -sU -Pn --top-ports 100 "$IP" -oN scans/udp-top100.txt || true
 
 echo
 echo "=============================================="
 echo "[+] 4. Web service discovery on all TCP ports"
 echo "=============================================="
+show_progress 4 "Web service discovery"
 
 : > enum/web/web-candidates.txt
 : > enum/web/live-web-urls.txt
@@ -1502,7 +1789,7 @@ done
 USE_HTTPX=false
 
 if have httpx; then
-    if httpx -h 2>&1 | grep -q -- '-l'; then
+    if run_with_timeout 10 httpx -h 2>&1 | grep -q -- '-l'; then
         USE_HTTPX=true
     else
         echo "[!] httpx found, but it does not appear to be ProjectDiscovery httpx. Falling back to curl."
@@ -1514,7 +1801,7 @@ fi
 if [ "$USE_HTTPX" = true ]; then
     echo "[+] ProjectDiscovery httpx found. Probing all open TCP ports for HTTP/HTTPS."
 
-    httpx \
+    run_with_timeout "$WEB_PROBE_MAXTIME" httpx \
         -l enum/web/web-candidates.txt \
         -title \
         -tech-detect \
@@ -1552,6 +1839,7 @@ echo
 echo "=============================="
 echo "[+] 5. Web enumeration"
 echo "=============================="
+show_progress 5 "Web enumeration"
 
 if [ -s enum/web/live-web-urls.txt ]; then
     WEB_URL_COUNT=0
@@ -1579,20 +1867,28 @@ if [ -s enum/web/live-web-urls.txt ]; then
         echo "[+] Host URL candidate: $HOST_URL"
 
         if have whatweb; then
-            whatweb "$URL" | tee "enum/web/whatweb-$SAFE_URL.txt" || true
-            whatweb "$HOST_URL" | tee "enum/web/whatweb-host-$SAFE_URL.txt" || true
+            run_with_timeout "$WEB_PROBE_MAXTIME" whatweb "$URL" \
+                | tee "enum/web/whatweb-$SAFE_URL.txt" || true
+            run_with_timeout "$WEB_PROBE_MAXTIME" whatweb "$HOST_URL" \
+                | tee "enum/web/whatweb-host-$SAFE_URL.txt" || true
         fi
 
         if have curl; then
-            curl -k -I "$URL" | tee "enum/web/headers-$SAFE_URL.txt" || true
-            curl -k -I -H "Host: $HOST" "$URL" | tee "enum/web/headers-host-$SAFE_URL.txt" || true
-            curl -k -s "$URL" -o "enum/web/index-$SAFE_URL.html" || true
-            curl -k -s -H "Host: $HOST" "$URL" -o "enum/web/index-host-$SAFE_URL.html" || true
+            curl -k -I --connect-timeout 5 --max-time "$CURL_MAXTIME" "$URL" \
+                | tee "enum/web/headers-$SAFE_URL.txt" || true
+            curl -k -I --connect-timeout 5 --max-time "$CURL_MAXTIME" -H "Host: $HOST" "$URL" \
+                | tee "enum/web/headers-host-$SAFE_URL.txt" || true
+            curl -k -s --connect-timeout 5 --max-time "$CURL_MAXTIME" \
+                "$URL" -o "enum/web/index-$SAFE_URL.html" || true
+            curl -k -s --connect-timeout 5 --max-time "$CURL_MAXTIME" -H "Host: $HOST" \
+                "$URL" -o "enum/web/index-host-$SAFE_URL.html" || true
 
             for WEBPATH in robots.txt sitemap.xml security.txt .well-known/security.txt .well-known/jwks.json jwks.json openapi.json swagger.json api-docs; do
                 SAFE_PATH="$(echo "$WEBPATH" | sed 's#[/]#_#g')"
-                curl -k -s -i "$URL/$WEBPATH" -o "enum/web/${SAFE_PATH}-$SAFE_URL.txt" || true
-                curl -k -s -i -H "Host: $HOST" "$URL/$WEBPATH" -o "enum/web/${SAFE_PATH}-host-$SAFE_URL.txt" || true
+                curl -k -s -i --connect-timeout 5 --max-time "$CURL_MAXTIME" \
+                    "$URL/$WEBPATH" -o "enum/web/${SAFE_PATH}-$SAFE_URL.txt" || true
+                curl -k -s -i --connect-timeout 5 --max-time "$CURL_MAXTIME" -H "Host: $HOST" \
+                    "$URL/$WEBPATH" -o "enum/web/${SAFE_PATH}-host-$SAFE_URL.txt" || true
             done
         fi
 
@@ -1624,8 +1920,10 @@ if [ -s enum/web/live-web-urls.txt ]; then
             JS_SAFE_NAME="$(safe_name "$JS_URL")"
 
             if have curl; then
-                curl -k -s "$JS_URL" -o "enum/web/js-$SAFE_URL-$JS_SAFE_NAME" || true
-                curl -k -s -H "Host: $HOST" "$JS_URL" -o "enum/web/js-host-$SAFE_URL-$JS_SAFE_NAME" || true
+                curl -k -s --connect-timeout 5 --max-time "$CURL_MAXTIME" \
+                    "$JS_URL" -o "enum/web/js-$SAFE_URL-$JS_SAFE_NAME" || true
+                curl -k -s --connect-timeout 5 --max-time "$CURL_MAXTIME" -H "Host: $HOST" \
+                    "$JS_URL" -o "enum/web/js-host-$SAFE_URL-$JS_SAFE_NAME" || true
             fi
         done < "enum/web/js-files-$SAFE_URL.txt"
 
@@ -1661,21 +1959,32 @@ if [ -s enum/web/live-web-urls.txt ]; then
 
         if have nikto; then
             echo "[+] Running nikto"
-            nikto -h "$URL" -output "enum/web/nikto-$SAFE_URL.txt" || true
+            run_with_timeout "$NIKTO_MAXTIME" nikto \
+                -h "$URL" \
+                -output "enum/web/nikto-$SAFE_URL.txt" || true
         fi
 
         if [ "$SCHEME" = "https" ] && have openssl; then
             echo "[+] Running HTTPS/TLS checks"
-            echo | openssl s_client -connect "$IP:$PORT" -servername "$HOST" 2>/dev/null \
+            echo | run_with_timeout "$WEB_PROBE_MAXTIME" openssl \
+                s_client -connect "$IP:$PORT" -servername "$HOST" 2>/dev/null \
                 | openssl x509 -noout -text > "enum/web/cert-$SAFE_URL.txt" || true
 
-            nmap --script ssl-cert,ssl-enum-ciphers -Pn -p "$PORT" "$IP" -oN "enum/web/nmap-ssl-$SAFE_URL.txt" || true
+            run_with_timeout "$NMAP_MAXTIME" nmap \
+                --script ssl-cert,ssl-enum-ciphers -Pn -p "$PORT" "$IP" \
+                -oN "enum/web/nmap-ssl-$SAFE_URL.txt" || true
         fi
 
         if have nuclei; then
             echo "[+] Running nuclei"
-            nuclei -u "$URL" -severity low,medium,high,critical -o "enum/web/nuclei-$SAFE_URL.txt" || true
+            run_with_timeout "$NUCLEI_MAXTIME" nuclei \
+                -u "$URL" \
+                -severity low,medium,high,critical \
+                -duc \
+                -o "enum/web/nuclei-$SAFE_URL.txt" || true
         fi
+
+        run_web_dast "$URL" "$SAFE_URL" "$WEB_URL_COUNT"
     done < enum/web/live-web-urls.txt
 else
     echo "[-] No web services detected."
@@ -1685,20 +1994,22 @@ echo
 echo "=============================="
 echo "[+] 6. DNS enumeration"
 echo "=============================="
+show_progress 6 "DNS enumeration"
 
 if ports_lines | grep -q '^53$'; then
     if have dig; then
-        dig @"$IP" "$HOST" A | tee enum/dns/dig-a.txt || true
-        dig @"$IP" "$HOST" ANY | tee enum/dns/dig-any.txt || true
-        dig @"$IP" "$HOST" NS | tee enum/dns/dig-ns.txt || true
-        dig @"$IP" "$HOST" SOA | tee enum/dns/dig-soa.txt || true
-        dig @"$IP" "$HOST" MX | tee enum/dns/dig-mx.txt || true
-        dig @"$IP" "$HOST" TXT | tee enum/dns/dig-txt.txt || true
-        dig axfr @"$IP" "$HOST" | tee enum/dns/axfr.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig @"$IP" "$HOST" A | tee enum/dns/dig-a.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig @"$IP" "$HOST" ANY | tee enum/dns/dig-any.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig @"$IP" "$HOST" NS | tee enum/dns/dig-ns.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig @"$IP" "$HOST" SOA | tee enum/dns/dig-soa.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig @"$IP" "$HOST" MX | tee enum/dns/dig-mx.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig @"$IP" "$HOST" TXT | tee enum/dns/dig-txt.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dig axfr @"$IP" "$HOST" | tee enum/dns/axfr.txt || true
     fi
 
     if have dnsrecon; then
-        dnsrecon -d "$HOST" -n "$IP" -a | tee enum/dns/dnsrecon.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dnsrecon -d "$HOST" -n "$IP" -a \
+            | tee enum/dns/dnsrecon.txt || true
     fi
 
     if have gobuster; then
@@ -1748,36 +2059,42 @@ echo
 echo "=============================="
 echo "[+] 7. SMB enumeration"
 echo "=============================="
+show_progress 7 "SMB enumeration"
 
 if ports_lines | grep -Eq '^(139|445)$'; then
     SMB_PORTS="$(ports_lines | grep -E '^(139|445)$' | paste -sd, -)"
 
     if have smbclient; then
-        smbclient -L "\\\\$IP" -N | tee enum/smb/smbclient-null.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" smbclient -L "\\\\$IP" -N \
+            | tee enum/smb/smbclient-null.txt || true
     fi
 
     if have enum4linux-ng; then
-        timeout 180 enum4linux-ng "$IP" -oA enum/smb/enum4linux-ng || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" enum4linux-ng "$IP" -oA enum/smb/enum4linux-ng || true
     elif have enum4linux; then
-        timeout 180 enum4linux -a "$IP" | tee enum/smb/enum4linux.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" enum4linux -a "$IP" \
+            | tee enum/smb/enum4linux.txt || true
     fi
 
     if have smbmap; then
-        smbmap -H "$IP" | tee enum/smb/smbmap-null.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" smbmap -H "$IP" \
+            | tee enum/smb/smbmap-null.txt || true
     fi
 
-    nmap \
+    run_with_timeout "$NMAP_MAXTIME" nmap \
         --script smb-os-discovery,smb-enum-shares,smb-enum-users,smb-enum-groups,smb-enum-services,smb-enum-sessions,smb-security-mode,smb2-security-mode,smb2-time \
         -Pn \
         -p "$SMB_PORTS" "$IP" \
         -oN enum/smb/nmap-smb-enum.txt || true
 
     if have netexec; then
-        netexec smb "$IP" | tee enum/smb/netexec-smb.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" netexec smb "$IP" \
+            | tee enum/smb/netexec-smb.txt || true
     fi
 
     if have crackmapexec; then
-        crackmapexec smb "$IP" | tee enum/smb/cme-smb.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" crackmapexec smb "$IP" \
+            | tee enum/smb/cme-smb.txt || true
     fi
 else
     echo "[-] SMB ports not detected."
@@ -1787,12 +2104,17 @@ echo
 echo "=============================="
 echo "[+] 8. FTP enumeration"
 echo "=============================="
+show_progress 8 "FTP enumeration"
 
 if ports_lines | grep -q '^21$'; then
-    nmap --script ftp-anon,ftp-syst,ftp-bounce -Pn -p21 "$IP" -oN enum/ftp/nmap-ftp.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script ftp-anon,ftp-syst,ftp-bounce -Pn -p21 "$IP" \
+        -oN enum/ftp/nmap-ftp.txt || true
 
     if have ftp; then
-        printf "anonymous\nanonymous@\nbye\n" | ftp -inv "$IP" 2>&1 | tee enum/ftp/ftp-anonymous-check.txt || true
+        printf "anonymous\nanonymous@\nbye\n" \
+            | run_with_timeout "$SERVICE_ENUM_MAXTIME" ftp -inv "$IP" 2>&1 \
+            | tee enum/ftp/ftp-anonymous-check.txt || true
     fi
 else
     echo "[-] FTP port not detected."
@@ -1802,12 +2124,15 @@ echo
 echo "=============================="
 echo "[+] 9. SSH enumeration"
 echo "=============================="
+show_progress 9 "SSH enumeration"
 
 if ports_lines | grep -q '^22$'; then
-    nmap --script ssh2-enum-algos,ssh-hostkey,ssh-auth-methods -Pn -p22 "$IP" -oN enum/ssh/nmap-ssh.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script ssh2-enum-algos,ssh-hostkey,ssh-auth-methods -Pn -p22 "$IP" \
+        -oN enum/ssh/nmap-ssh.txt || true
 
     if have nc; then
-        nc -nv "$IP" 22 2>&1 | tee enum/ssh/ssh-banner.txt || true
+        run_with_timeout 30 nc -nv "$IP" 22 2>&1 | tee enum/ssh/ssh-banner.txt || true
     fi
 else
     echo "[-] SSH port not detected."
@@ -1817,15 +2142,19 @@ echo
 echo "=============================="
 echo "[+] 10. NFS enumeration"
 echo "=============================="
+show_progress 10 "NFS enumeration"
 
 if ports_lines | grep -Eq '^(111|2049)$'; then
     NFS_PORTS="$(ports_lines | grep -E '^(111|2049)$' | paste -sd, -)"
 
     if have showmount; then
-        showmount -e "$IP" | tee enum/nfs/showmount.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" showmount -e "$IP" \
+            | tee enum/nfs/showmount.txt || true
     fi
 
-    nmap --script nfs-ls,nfs-showmount,nfs-statfs -Pn -p "$NFS_PORTS" "$IP" -oN enum/nfs/nmap-nfs.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script nfs-ls,nfs-showmount,nfs-statfs -Pn -p "$NFS_PORTS" "$IP" \
+        -oN enum/nfs/nmap-nfs.txt || true
 else
     echo "[-] NFS/RPCBind ports not detected."
 fi
@@ -1834,13 +2163,16 @@ echo
 echo "=============================="
 echo "[+] 11. RPC enumeration"
 echo "=============================="
+show_progress 11 "RPC enumeration"
 
 if ports_lines | grep -q '^111$'; then
     if have rpcinfo; then
-        rpcinfo -p "$IP" | tee enum/rpc/rpcinfo.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" rpcinfo -p "$IP" \
+            | tee enum/rpc/rpcinfo.txt || true
     fi
 
-    nmap --script rpc-grind,rpcinfo -Pn -p111 "$IP" -oN enum/rpc/nmap-rpc.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script rpc-grind,rpcinfo -Pn -p111 "$IP" -oN enum/rpc/nmap-rpc.txt || true
 else
     echo "[-] RPCBind port not detected."
 fi
@@ -1849,21 +2181,26 @@ echo
 echo "=============================="
 echo "[+] 12. SNMP enumeration"
 echo "=============================="
+show_progress 12 "SNMP enumeration"
 
 if grep -q '161/udp.*open' scans/udp-top100.txt 2>/dev/null; then
     if have onesixtyone; then
         if [ -n "$SNMP_WORDLIST" ]; then
-            onesixtyone -c "$SNMP_WORDLIST" "$IP" | tee enum/snmp/onesixtyone.txt || true
+            run_with_timeout "$SERVICE_ENUM_MAXTIME" onesixtyone -c "$SNMP_WORDLIST" "$IP" \
+                | tee enum/snmp/onesixtyone.txt || true
         else
             echo "[!] Skipping onesixtyone: no SNMP community wordlist found."
         fi
     fi
 
     if have snmpwalk; then
-        snmpwalk -v2c -c public "$IP" | tee enum/snmp/snmpwalk-public.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" snmpwalk -v2c -c public "$IP" \
+            | tee enum/snmp/snmpwalk-public.txt || true
     fi
 
-    nmap -sU --script snmp-info,snmp-interfaces,snmp-processes,snmp-sysdescr -Pn -p161 "$IP" -oN enum/snmp/nmap-snmp.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        -sU --script snmp-info,snmp-interfaces,snmp-processes,snmp-sysdescr \
+        -Pn -p161 "$IP" -oN enum/snmp/nmap-snmp.txt || true
 else
     echo "[-] SNMP UDP/161 not detected in top UDP scan."
 fi
@@ -1872,14 +2209,19 @@ echo
 echo "=============================="
 echo "[+] 13. LDAP enumeration"
 echo "=============================="
+show_progress 13 "LDAP enumeration"
 
 if ports_lines | grep -Eq '^(389|636|3268|3269)$'; then
     LDAP_PORTS="$(ports_lines | grep -E '^(389|636|3268|3269)$' | paste -sd, -)"
 
-    nmap --script ldap-rootdse,ldap-search -Pn -p "$LDAP_PORTS" "$IP" -oN enum/ldap/nmap-ldap.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script ldap-rootdse,ldap-search -Pn -p "$LDAP_PORTS" "$IP" \
+        -oN enum/ldap/nmap-ldap.txt || true
 
     if have ldapsearch; then
-        ldapsearch -x -H "ldap://$IP" -s base namingcontexts | tee enum/ldap/namingcontexts.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" ldapsearch \
+            -x -H "ldap://$IP" -s base namingcontexts \
+            | tee enum/ldap/namingcontexts.txt || true
     fi
 else
     echo "[-] LDAP ports not detected."
@@ -1889,9 +2231,11 @@ echo
 echo "=============================="
 echo "[+] 14. Kerberos enumeration"
 echo "=============================="
+show_progress 14 "Kerberos enumeration"
 
 if ports_lines | grep -q '^88$'; then
-    nmap --script krb5-enum-users -Pn -p88 "$IP" -oN enum/kerberos/nmap-kerberos.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script krb5-enum-users -Pn -p88 "$IP" -oN enum/kerberos/nmap-kerberos.txt || true
 else
     echo "[-] Kerberos port not detected."
 fi
@@ -1900,18 +2244,22 @@ echo
 echo "=============================="
 echo "[+] 15. WinRM enumeration"
 echo "=============================="
+show_progress 15 "WinRM enumeration"
 
 if ports_lines | grep -Eq '^(5985|5986)$'; then
     WINRM_PORTS="$(ports_lines | grep -E '^(5985|5986)$' | paste -sd, -)"
 
-    nmap -sV -Pn -p "$WINRM_PORTS" "$IP" -oN enum/winrm/nmap-winrm.txt || true
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        -sV -Pn -p "$WINRM_PORTS" "$IP" -oN enum/winrm/nmap-winrm.txt || true
 
     if have netexec; then
-        netexec winrm "$IP" | tee enum/winrm/netexec-winrm.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" netexec winrm "$IP" \
+            | tee enum/winrm/netexec-winrm.txt || true
     fi
 
     if have crackmapexec; then
-        crackmapexec winrm "$IP" | tee enum/winrm/cme-winrm.txt || true
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" crackmapexec winrm "$IP" \
+            | tee enum/winrm/cme-winrm.txt || true
     fi
 else
     echo "[-] WinRM ports not detected."
@@ -1921,6 +2269,7 @@ echo
 echo "=============================="
 echo "[+] 16. Generate port summary"
 echo "=============================="
+show_progress 16 "Generate port summary"
 
 {
     echo "# Port Summary"
@@ -1942,14 +2291,18 @@ echo
 echo "========================================="
 echo "[+] 17. Optional vulnerability Nmap scan"
 echo "========================================="
+show_progress 17 "Nmap vulnerability scan"
 
 echo "[+] This scan can be slow/noisy. Treat results as hints."
-nmap --script vuln -Pn -p "$PORTS" "$IP" -oN scans/tcp-vuln.txt || true
+echo "[+] Service detection is enabled so version-dependent scripts such as Vulners can run."
+run_with_timeout "$NMAP_MAXTIME" nmap \
+    -sV --script vuln -Pn -p "$PORTS" "$IP" -oN scans/tcp-vuln.txt || true
 
 echo
 echo "=============================="
 echo "[+] 18. Interesting grep"
 echo "=============================="
+show_progress 18 "Interesting-result extraction"
 
 grep -RniI \
     --exclude="interesting-grep.txt" \
@@ -1971,6 +2324,7 @@ echo
 echo "=============================="
 echo "[+] 19. Generate recon summary"
 echo "=============================="
+show_progress 19 "Generate recon summary"
 
 {
     echo "# Recon Summary - $BOX"
@@ -2076,9 +2430,18 @@ echo "=============================="
 } > summary.md
 
 echo
+echo "========================================"
+echo "[+] 20. Online OSV/NVD vulnerability intel"
+echo "========================================"
+show_progress 20 "Online OSV/NVD vulnerability intelligence"
+
+run_online_vuln_analysis
+
+echo
 echo "[+] Recon complete."
 echo "[+] Main files to review:"
 echo "    summary.md"
+echo "    recon-analysis.md"
 echo "    scans/tcp-full.txt"
 echo "    scans/tcp-services.txt"
 echo "    scans/tcp-aggressive.txt"
@@ -2097,14 +2460,17 @@ echo "    writeup.md"
 
 echo
 echo "=============================="
-echo "[+] 20. Creating recon archive"
+echo "[+] 21. Creating recon archive"
 echo "=============================="
+show_progress 21 "Create recon archive"
 
-if ! ./zip-recon.sh; then
+if ! run_with_timeout "$ARCHIVE_MAXTIME" ./zip-recon.sh; then
     echo "[!] WARNING: Recon archive creation failed."
 fi
 
 END_TIME="$(date)"
+END_EPOCH="$(date +%s)"
+echo "[+] Progress: 100% | elapsed $(format_elapsed "$((END_EPOCH - START_EPOCH))") | all stages complete"
 echo "[+] Recon finished at: $END_TIME"
 EOF
 
@@ -2271,7 +2637,6 @@ less summary.md
 Default recon is conservative to avoid ffuf/ferox loops on dynamic targets.
 
 \`\`\`bash
-./recon.sh
 # Fast default recon
 ./recon.sh
 
@@ -2285,6 +2650,19 @@ FEROX_EXTENSIONS=0 FEROX_COLLECT=0 ./recon.sh
 RECON_DEEP=1 FEROX_EXTENSIONS=1 FEROX_COLLECT=1 FFUF_CONTENT=1 ./recon.sh
 FFUF_RATE=40 FFUF_THREADS=10 FFUF_MAXTIME=180 ./recon.sh
 FFUF_VHOST=0 ./recon.sh
+VHOST_SUFFIXES=htb,vl,local,test ./recon.sh
+NIKTO_MAXTIME=300 NUCLEI_MAXTIME=300 ./recon.sh
+NMAP_MAXTIME=600 SERVICE_ENUM_MAXTIME=180 ./recon.sh
+UPDATE_SCANNER_DATA=0 ./recon.sh
+
+# Active DAST is bounded and enabled for the first web target by default
+MAX_DAST_TARGETS=2 DAST_MAXTIME=300 WAPITI_MAXTIME=300 ./recon.sh
+WEB_DAST=0 ./recon.sh
+
+# Online OSV/NVD enrichment runs by default after collection
+ONLINE_VULN_CHECK=0 ./recon.sh
+VULN_TIMEOUT=30 MAX_VULN_RESULTS=5 ./recon.sh
+VULN_ANALYZER=/path/to/analyze-recon.py ./recon.sh
 \`\`\`
 
 ## Zip Recon Manually

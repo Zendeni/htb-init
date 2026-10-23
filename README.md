@@ -83,6 +83,77 @@ When a compatible ScopeLens installation is available, the initializer prepares 
 
 The initializer creates a workspace and supporting scripts. The new integration does not run those collection scripts. Add already collected artifacts to `scans/` and `enum/`, then inspect and review the workspace.
 
+## One-launch reconnaissance and vulnerability intelligence
+
+The generated collector runs the complete reconnaissance workflow with one
+command:
+
+```bash
+./recon.sh
+```
+
+Its vulnerability stage enables Nmap service detection before the `vuln`
+script category, allowing version-dependent scripts such as Vulners to query
+current online intelligence. After collection, the bundled legacy analyzer
+queries OSV and NVD for detected packages and technologies and writes
+`recon-analysis.md`. Nuclei and Nikto continue to provide template-based web
+checks. Every external network scanner has a time ceiling. A
+timed-out command receives `TERM`, then `KILL` after ten seconds, and the next
+stage continues. Stage updates include percentage and elapsed time.
+
+The main safety limits (in seconds) are `NMAP_MAXTIME=900`,
+`SERVICE_ENUM_MAXTIME=300`, `WEB_PROBE_MAXTIME=120`, `FEROX_MAXTIME=240`,
+`FFUF_MAXTIME=180`, `NIKTO_MAXTIME=600`, `NUCLEI_MAXTIME=600`,
+`DAST_MAXTIME=300`, `WAPITI_MAXTIME=300`, `ANALYZER_MAXTIME=900`, and
+`ARCHIVE_MAXTIME=300`. Override any of them for one run, for example:
+
+```bash
+NMAP_MAXTIME=600 NIKTO_MAXTIME=300 NUCLEI_MAXTIME=300 ./recon.sh
+```
+
+When a web application is found, active DAST is enabled for the first web
+target by default. Nuclei runs its low-aggression fuzzing templates, including
+XSS, SQL injection, command injection, LFI/RFI, SSRF, SSTI, redirects, and XXE
+classes. If Wapiti is installed, a bounded complementary scan checks its common
+injection, file, upload, CSRF, and method modules. These are active requests and
+may submit payloads or use external callback services, so use this workflow only
+on an authorized lab target. Increase `MAX_DAST_TARGETS`, or disable the pass:
+
+```bash
+MAX_DAST_TARGETS=2 ./recon.sh
+WEB_DAST=0 ./recon.sh
+```
+
+At startup, the collector refreshes Nuclei templates and Wapiti attack modules,
+then rebuilds Nmap's local NSE script index. Nikto performs its own built-in
+update check when scanning. The preflight is bounded and can be disabled for a
+repeatable offline run:
+
+```bash
+UPDATE_SCANNER_DATA=0 ./recon.sh
+```
+
+The collector deliberately does not upgrade scanner binaries or operating-system
+packages; manage those separately with the host's package manager.
+
+Online enrichment is enabled by default. Disable it for an offline collection:
+
+```bash
+ONLINE_VULN_CHECK=0 ./recon.sh
+```
+
+Online matches are research leads, not proof of exploitability. Distribution
+backports, broad product matches, and incomplete version fingerprints can all
+produce false positives.
+
+Vhost namespace discovery accepts HTB-style suffixes (`htb`, `vl`, and
+`local`) by default so external links found in page content are not fuzzed as
+target namespaces. Extend the list when a lab uses another suffix:
+
+```bash
+VHOST_SUFFIXES=htb,vl,local,test ./recon.sh
+```
+
 ## Files you will use
 
 | File or directory | Purpose |
@@ -92,6 +163,8 @@ The initializer creates a workspace and supporting scripts. The new integration 
 | `analyze.sh` | Run an offline review with a fresh output directory |
 | `inspect.sh` | Inspect artifact coverage and saved reports |
 | `ANALYSIS.md` | Local instructions for the shared analysis workflow |
+| `tools/analyze-recon.py` | Bundled legacy analyzer used for automatic OSV/NVD enrichment |
+| `recon-analysis.md` | Online vulnerability-intelligence report produced by `recon.sh` |
 | `scans/`, `enum/` | Existing collected artifacts |
 | `reports/` | Separate review snapshots; excluded from subsequent evidence imports |
 | `notes.md`, `writeup.md` | Your working notes and final writeup |
