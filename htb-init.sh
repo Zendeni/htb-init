@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-INIT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INITIALIZER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INIT_SOURCE_DIR="$INITIALIZER_DIR"
 
 usage() {
     cat <<'USAGE'
@@ -146,6 +147,24 @@ HOST="$HOST"
 #   enum/dns/vhost-base-domains.txt
 EOF
 printf 'BASE_DIR=%q\n' "$BASE_DIR" >> .target.env
+
+# Keep the assessor alongside its workspace so it remains usable independently
+# of this checkout. A copied initializer still works without the optional asset.
+if [[ -f "$INITIALIZER_DIR/web-assess.py" ]]; then
+    if [[ "$INITIALIZER_DIR" != "$BASE_DIR" ]]; then
+        cp "$INITIALIZER_DIR/web-assess.py" ./web-assess.py
+    fi
+    cat > web-assess.sh <<'WEB_ASSESS_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${HTB_PYTHON:-python3}" -I "$SCRIPT_DIR/web-assess.py" --workspace "$SCRIPT_DIR" "$@"
+WEB_ASSESS_EOF
+    chmod +x web-assess.sh
+else
+    echo "[i] web-assess.py is not alongside the initializer; automatic web assessment unavailable."
+    echo "    Use the full repository checkout to install the web assessment helper."
+fi
 
 cat > update-hosts.sh <<'EOF'
 #!/usr/bin/env bash
@@ -435,7 +454,7 @@ fi
 echo "[+] Creating recon archive: $OUTFILE"
 
 REVIEW_FILES=()
-for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md recon-analysis.md tools/analyze-recon.py; do
+for REVIEW_FILE in scope.json analyze.sh inspect.sh ANALYSIS.md recon-analysis.md tools/analyze-recon.py web-assess.sh web-assess.py; do
     if [[ -f "$REVIEW_FILE" && ! -L "$REVIEW_FILE" ]]; then
         REVIEW_FILES+=("$REVIEW_FILE")
     fi
@@ -581,7 +600,7 @@ exec > >(tee -a recon-console.log) 2>&1
 
 START_TIME="$(date)"
 START_EPOCH="$(date +%s)"
-TOTAL_STAGES=21
+TOTAL_STAGES=22
 
 # Runtime safety knobs. Defaults are intentionally conservative so recon does not
 # appear to hang in ffuf/ferox sections on dynamic or slow web targets.
@@ -593,6 +612,7 @@ TOTAL_STAGES=21
 #   ONLINE_VULN_CHECK=0 ./recon.sh
 RECON_DEEP="${RECON_DEEP:-0}"
 WEB_ENUM="${WEB_ENUM:-1}"
+WEB_ASSESS="${WEB_ASSESS:-1}"
 FEROX_ENABLE="${FEROX_ENABLE:-1}"
 FEROX_EXTENSIONS="${FEROX_EXTENSIONS:-0}"
 FEROX_COLLECT="${FEROX_COLLECT:-0}"
@@ -605,13 +625,7 @@ FEROX_MAXTIME="${FEROX_MAXTIME:-240}"
 FEROX_THREADS="${FEROX_THREADS:-10}"
 NIKTO_MAXTIME="${NIKTO_MAXTIME:-600}"
 NUCLEI_MAXTIME="${NUCLEI_MAXTIME:-600}"
-WEB_DAST="${WEB_DAST:-1}"
-DAST_MAXTIME="${DAST_MAXTIME:-300}"
-DAST_RATE="${DAST_RATE:-20}"
-DAST_MAX_INPUTS="${DAST_MAX_INPUTS:-100}"
-MAX_DAST_TARGETS="${MAX_DAST_TARGETS:-1}"
-WAPITI_MAXTIME="${WAPITI_MAXTIME:-300}"
-WAPITI_MODULES="${WAPITI_MODULES:-exec,file,permanentxss,redirect,sql,ssrf,upload,xss,xxe,crlf,csrf,ldap,methods}"
+WEB_ASSESS_MAXTIME="${WEB_ASSESS_MAXTIME:-2100}"
 SCANNER_UPDATE_MAXTIME="${SCANNER_UPDATE_MAXTIME:-180}"
 UPDATE_SCANNER_DATA="${UPDATE_SCANNER_DATA:-1}"
 NMAP_MAXTIME="${NMAP_MAXTIME:-900}"
@@ -628,6 +642,9 @@ ONLINE_VULN_CHECK="${ONLINE_VULN_CHECK:-1}"
 VULN_ANALYZER="${VULN_ANALYZER:-}"
 VULN_TIMEOUT="${VULN_TIMEOUT:-20}"
 MAX_VULN_RESULTS="${MAX_VULN_RESULTS:-8}"
+# Deduplicate successful scans within this run only. Persisted .done files used
+# to suppress later recon runs, even after a timeout or failed ffuf invocation.
+declare -A VHOST_SCANS_DONE=()
 
 have() {
     command -v "$1" >/dev/null 2>&1
@@ -862,11 +879,6 @@ refresh_scanner_data() {
         run_with_timeout "$SCANNER_UPDATE_MAXTIME" nmap --script-updatedb || true
     fi
 
-    if have wapiti; then
-        echo "[+] Updating Wapiti attack modules before active DAST."
-        run_with_timeout "$SCANNER_UPDATE_MAXTIME" wapiti --update || true
-    fi
-
     if have nikto; then
         echo "[+] Nikto will perform its built-in update check when its scan starts."
     fi
@@ -913,7 +925,7 @@ ffuf_extensions_arg() {
 wordlist_line_count() {
     local wordlist="$1"
     if [ -f "$wordlist" ]; then
-        grep -vE '^[[:space:]]*(#|$)' "$wordlist" 2>/dev/null | wc -l | tr -d ' '
+        awk '!/^[[:space:]]*(#|$)/ { count++ } END { print count+0 }' "$wordlist"
     else
         echo 0
     fi
@@ -1207,7 +1219,7 @@ run_ffuf_content_plan() {
 run_vhost_ffuf() {
     local url="$1"
     local safe_url="$2"
-    local scheme port lock_file base_domain safe_base output_file
+    local scheme port scan_key base_domain safe_base output_file label vhost_wordlist
 
     if [ "$WEB_ENUM" != "1" ]; then
         echo "[!] Skipping ffuf vhost discovery because WEB_ENUM=$WEB_ENUM."
@@ -1227,8 +1239,8 @@ run_vhost_ffuf() {
         return 0
     fi
 
-    if [ -z "$DNS_WORDLIST" ]; then
-        echo "[!] Skipping ffuf vhost discovery: no DNS wordlist found."
+    if [ ! -f "$PRIORITY_VHOST_WORDLIST" ] && [ ! -f "$DNS_WORDLIST" ]; then
+        echo "[!] Skipping ffuf vhost discovery: no vhost wordlist found."
         return 0
     fi
 
@@ -1253,17 +1265,15 @@ run_vhost_ffuf() {
             [ -f "$vhost_wordlist" ] || continue
 
             label="$(safe_name "$(basename "$vhost_wordlist")")"
-            lock_file="enum/web/.ffuf-vhost-$scheme-$port-$safe_base-$label.done"
+            scan_key="$scheme/$port/$base_domain/$vhost_wordlist"
             output_file="enum/web/ffuf-vhosts-$safe_url-$safe_base-$label.json"
 
-            if [ -f "$lock_file" ]; then
+            if [ "${VHOST_SCANS_DONE[$scan_key]:-0}" = "1" ]; then
                 echo "[!] Skipping duplicate ffuf vhost scan for $scheme/$port base $base_domain wordlist $label."
                 continue
             fi
-            touch "$lock_file"
-
             echo "[+] Running bounded ffuf vhost discovery with $vhost_wordlist against base domain: $base_domain"
-            run_with_timeout "$FFUF_MAXTIME" ffuf \
+            if run_with_timeout "$FFUF_MAXTIME" ffuf \
                 -noninteractive \
                 -ac \
                 -t "$FFUF_THREADS" \
@@ -1273,7 +1283,11 @@ run_vhost_ffuf() {
                 -u "$url/" \
                 -H "Host: FUZZ.$base_domain" \
                 -of json \
-                -o "$output_file" || true
+                -o "$output_file"; then
+                VHOST_SCANS_DONE["$scan_key"]=1
+            else
+                echo "[!] ffuf vhost scan did not complete: $base_domain ($label). It may be retried."
+            fi
         done
     done < enum/dns/vhost-base-domains.txt
 }
@@ -1320,103 +1334,6 @@ run_cms_specific_checks() {
             curl -k -s -i --connect-timeout 5 --max-time "$CURL_MAXTIME" \
                 "$url/$path" -o "enum/web/api-$safe_path-$safe_url.txt" || true
         done
-    fi
-}
-
-build_dast_input_file() {
-    local url="$1"
-    local safe_url="$2"
-    local output_file="$3"
-    local candidate file tmp_file
-
-    : > "$output_file"
-    append_unique_line "$url" "$output_file"
-
-    for file in enum/web/ferox-"$safe_url"-*.txt; do
-        [ -f "$file" ] || continue
-        while read -r candidate; do
-            case "$candidate" in
-                "$url"*) append_unique_line "$candidate" "$output_file" ;;
-            esac
-        done < <(grep -Eo 'https?://[^][(){}<>"[:space:]]+' "$file" 2>/dev/null || true)
-    done
-
-    if have jq; then
-        for file in enum/web/ffuf-content-"$safe_url"-*.json; do
-            [ -f "$file" ] || continue
-            while read -r candidate; do
-                case "$candidate" in
-                    "$url"*) append_unique_line "$candidate" "$output_file" ;;
-                esac
-            done < <(jq -r '.results[]?.url // empty' "$file" 2>/dev/null || true)
-        done
-    fi
-
-    tmp_file="$(mktemp)"
-    head -n "$DAST_MAX_INPUTS" "$output_file" > "$tmp_file"
-    mv "$tmp_file" "$output_file"
-}
-
-run_web_dast() {
-    local url="$1"
-    local safe_url="$2"
-    local target_number="$3"
-    local input_file="enum/web/dast-inputs-$safe_url.txt"
-    local wapiti_scan_time
-
-    if [ "$WEB_DAST" != "1" ]; then
-        echo "[!] Skipping active web DAST because WEB_DAST=$WEB_DAST."
-        return 0
-    fi
-
-    if [ "$target_number" -gt "$MAX_DAST_TARGETS" ]; then
-        echo "[!] DAST target budget reached at MAX_DAST_TARGETS=$MAX_DAST_TARGETS; skipping $url."
-        return 0
-    fi
-
-    build_dast_input_file "$url" "$safe_url" "$input_file"
-    echo "[+] Active web DAST inputs: $(wc -l < "$input_file" | tr -d ' ')"
-
-    if have nuclei; then
-        echo "[+] Running bounded Nuclei DAST (low fuzzing aggression)."
-        run_with_timeout "$DAST_MAXTIME" nuclei \
-            -l "$input_file" \
-            -H "Host: $HOST" \
-            -dast \
-            -fa low \
-            -rl "$DAST_RATE" \
-            -severity low,medium,high,critical \
-            -duc \
-            -o "enum/web/nuclei-dast-$safe_url.txt" || true
-    fi
-
-    if have wapiti; then
-        echo "[+] Running bounded Wapiti DAST modules: $WAPITI_MODULES"
-        wapiti_scan_time="$WAPITI_MAXTIME"
-        if [[ "$WAPITI_MAXTIME" =~ ^[0-9]+$ ]] && [ "$WAPITI_MAXTIME" -gt 30 ]; then
-            wapiti_scan_time="$((WAPITI_MAXTIME - 30))"
-        fi
-        run_with_timeout "$WAPITI_MAXTIME" wapiti \
-            -u "$url" \
-            -H "Host: $HOST" \
-            --scope folder \
-            --headless no \
-            --flush-session \
-            --store-session "enum/web/wapiti-session-$safe_url" \
-            --store-config "enum/web/wapiti-config-$safe_url" \
-            --max-scan-time "$wapiti_scan_time" \
-            --max-attack-time 45 \
-            --max-links-per-page 50 \
-            --max-files-per-dir 100 \
-            --max-parameters 20 \
-            --tasks 4 \
-            -S polite \
-            -t "$CURL_MAXTIME" \
-            -m "$WAPITI_MODULES" \
-            -f json \
-            -o "enum/web/wapiti-$safe_url.json" \
-            --no-bugreport \
-            -v 1 || true
     fi
 }
 
@@ -1484,8 +1401,15 @@ probe_discovered_hostnames() {
         return 0
     fi
 
-    ports_to_probe="$(ports_lines | grep -E '^(80|443|8000|8080|8443|3000|5000|9000|9090)$' | sort -nu | tr '\n' ' ')"
-    [ -n "$ports_to_probe" ] || ports_to_probe="80 443"
+    # An SSH-only target used to exit here under pipefail because grep found no
+    # common HTTP port. Also include HTTP services found on nonstandard ports.
+    ports_to_probe="$({
+        ports_lines | grep -E '^(80|443|8000|8080|8443|3000|5000|9000|9090)$' || true
+        while read -r url; do
+            [ -n "$url" ] && url_port "$url"
+        done < enum/web/live-web-urls.txt
+    } | sort -nu | tr '\n' ' ')"
+    [ -n "$ports_to_probe" ] || return 0
 
     while read -r name; do
         [ -z "$name" ] && continue
@@ -1507,7 +1431,7 @@ probe_discovered_hostnames() {
                 code="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 5 --resolve "$name:$port:$IP" "$url" || true)"
                 echo "$url $code" | tee -a enum/web/discovered-host-web-probe.txt
 
-                if [[ "$code" =~ ^(200|201|202|204|301|302|303|307|308|400|401|403|405|500|502|503)$ ]]; then
+                if [[ "$code" =~ ^[1-5][0-9]{2}$ ]]; then
                     append_unique_line "$url" enum/web/discovered-host-web-urls.txt
                 fi
             done
@@ -1637,14 +1561,14 @@ append_unique_line "$HOST" enum/dns/vhost-base-domains.txt
 echo "[+] Starting recon for $BOX / $IP"
 echo "[+] Hostname: $HOST"
 echo "[+] Started at: $START_TIME"
-echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE NIKTO_MAXTIME=$NIKTO_MAXTIME NUCLEI_MAXTIME=$NUCLEI_MAXTIME WEB_DAST=$WEB_DAST DAST_MAXTIME=$DAST_MAXTIME DAST_RATE=$DAST_RATE MAX_DAST_TARGETS=$MAX_DAST_TARGETS WAPITI_MAXTIME=$WAPITI_MAXTIME NMAP_MAXTIME=$NMAP_MAXTIME SERVICE_ENUM_MAXTIME=$SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME=$WEB_PROBE_MAXTIME CURL_MAXTIME=$CURL_MAXTIME ANALYZER_MAXTIME=$ANALYZER_MAXTIME ARCHIVE_MAXTIME=$ARCHIVE_MAXTIME UPDATE_SCANNER_DATA=$UPDATE_SCANNER_DATA SCANNER_UPDATE_MAXTIME=$SCANNER_UPDATE_MAXTIME MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS VHOST_SUFFIXES=$VHOST_SUFFIXES ONLINE_VULN_CHECK=$ONLINE_VULN_CHECK VULN_TIMEOUT=$VULN_TIMEOUT MAX_VULN_RESULTS=$MAX_VULN_RESULTS"
+echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM WEB_ASSESS=$WEB_ASSESS WEB_ASSESS_MAXTIME=$WEB_ASSESS_MAXTIME FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE NIKTO_MAXTIME=$NIKTO_MAXTIME NUCLEI_MAXTIME=$NUCLEI_MAXTIME NMAP_MAXTIME=$NMAP_MAXTIME SERVICE_ENUM_MAXTIME=$SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME=$WEB_PROBE_MAXTIME CURL_MAXTIME=$CURL_MAXTIME ANALYZER_MAXTIME=$ANALYZER_MAXTIME ARCHIVE_MAXTIME=$ARCHIVE_MAXTIME UPDATE_SCANNER_DATA=$UPDATE_SCANNER_DATA SCANNER_UPDATE_MAXTIME=$SCANNER_UPDATE_MAXTIME MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS VHOST_SUFFIXES=$VHOST_SUFFIXES ONLINE_VULN_CHECK=$ONLINE_VULN_CHECK VULN_TIMEOUT=$VULN_TIMEOUT MAX_VULN_RESULTS=$MAX_VULN_RESULTS"
 
 echo
 echo "=============================="
 echo "[+] 0. Tool availability check"
 echo "=============================="
 
-for TOOL in nmap timeout whatweb feroxbuster ffuf nikto wapiti curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
+for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
     if have "$TOOL"; then
         echo "[+] $TOOL found"
     else
@@ -1697,11 +1621,16 @@ echo "[+] 1. TCP full port discovery"
 echo "=============================="
 show_progress 1 "TCP full port discovery"
 
+: > scans/open-tcp-ports.txt
+# These manifests describe this run. Do not leave prior web targets available
+# to downstream assessment when a later scan finds no open ports or fails.
+: > enum/web/live-web-urls.txt
+: > enum/web/discovered-host-web-urls.txt
 TCP_DISCOVERY_STATUS=0
 run_with_timeout "$NMAP_MAXTIME" nmap \
     -p- --min-rate 5000 -Pn "$IP" -oN scans/tcp-full.txt || TCP_DISCOVERY_STATUS=$?
 
-PORTS="$(grep -oP '^\d+/tcp\s+open' scans/tcp-full.txt | cut -d/ -f1 | paste -sd, - || true)"
+PORTS="$(awk '$1 ~ /^[0-9]+\/tcp$/ && $2 == "open" { sub(/\/tcp$/, "", $1); print $1 }' scans/tcp-full.txt | paste -sd, -)"
 
 if [ -z "$PORTS" ]; then
     echo "[-] No open TCP ports found."
@@ -1749,11 +1678,13 @@ echo "======================================"
 show_progress 2 "TCP service/version enumeration"
 
 run_with_timeout "$NMAP_MAXTIME" nmap \
-    -sC -sV -Pn -p "$PORTS" "$IP" -oN scans/tcp-services.txt || true
+    -sC -sV -Pn -p "$PORTS" "$IP" \
+    -oN scans/tcp-services.txt -oX scans/tcp-services.xml || true
 run_with_timeout "$NMAP_MAXTIME" nmap \
     -A -Pn -p "$PORTS" "$IP" -oN scans/tcp-aggressive.txt || true
 run_with_timeout "$NMAP_MAXTIME" nmap \
-    --script default,safe -Pn -p "$PORTS" "$IP" -oN scans/tcp-default-safe-scripts.txt || true
+    -sV --script default,safe -Pn -p "$PORTS" "$IP" \
+    -oN scans/tcp-default-safe-scripts.txt || true
 
 echo
 echo "=============================="
@@ -1824,7 +1755,7 @@ if [ ! -s enum/web/live-web-urls.txt ]; then
         CODE="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 4 "$URL" || true)"
         echo "$URL $CODE" | tee -a enum/web/curl-web-probe.txt
 
-        if [[ "$CODE" =~ ^(200|201|202|204|301|302|303|307|308|400|401|403|405|500|502|503)$ ]]; then
+        if [[ "$CODE" =~ ^[1-5][0-9]{2}$ ]]; then
             echo "$URL" >> enum/web/live-web-urls.txt
         fi
     done < enum/web/web-candidates.txt
@@ -1955,9 +1886,11 @@ if [ -s enum/web/live-web-urls.txt ]; then
         run_ferox_plan "$URL" "$SAFE_URL" "$WORDLIST_PLAN" "$WEB_EXTENSIONS"
         run_ffuf_content_plan "$URL" "$SAFE_URL" "$WORDLIST_PLAN" "$WEB_EXTENSIONS" "$TECH_PROFILE"
         run_vhost_ffuf "$URL" "$SAFE_URL"
-        run_cms_specific_checks "$URL" "$SAFE_URL" "$TECH_PROFILE"
+        if [[ "$WEB_ENUM" == "1" ]]; then
+            run_cms_specific_checks "$URL" "$SAFE_URL" "$TECH_PROFILE"
+        fi
 
-        if have nikto; then
+        if [[ "$WEB_ENUM" == "1" ]] && have nikto; then
             echo "[+] Running nikto"
             run_with_timeout "$NIKTO_MAXTIME" nikto \
                 -h "$URL" \
@@ -1975,16 +1908,7 @@ if [ -s enum/web/live-web-urls.txt ]; then
                 -oN "enum/web/nmap-ssl-$SAFE_URL.txt" || true
         fi
 
-        if have nuclei; then
-            echo "[+] Running nuclei"
-            run_with_timeout "$NUCLEI_MAXTIME" nuclei \
-                -u "$URL" \
-                -severity low,medium,high,critical \
-                -duc \
-                -o "enum/web/nuclei-$SAFE_URL.txt" || true
-        fi
-
-        run_web_dast "$URL" "$SAFE_URL" "$WEB_URL_COUNT"
+        # Broad Nuclei/DAST assessment runs once after hostname discovery below.
     done < enum/web/live-web-urls.txt
 else
     echo "[-] No web services detected."
@@ -2057,9 +1981,34 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 7. SMB enumeration"
+echo "[+] 7. Web application assessment"
 echo "=============================="
-show_progress 7 "SMB enumeration"
+show_progress 7 "Web application assessment"
+
+if [[ "$WEB_ASSESS" == "1" ]] && { [[ -s enum/web/live-web-urls.txt ]] || [[ -s enum/web/discovered-host-web-urls.txt ]]; }; then
+    if [[ -f ./web-assess.sh && -f ./web-assess.py ]]; then
+        if run_with_timeout "$WEB_ASSESS_MAXTIME" bash ./web-assess.sh; then
+            echo "[+] Automated web assessment finished; review its coverage limits."
+        else
+            WEB_ASSESS_STATUS=$?
+            if [[ "$WEB_ASSESS_STATUS" == "1" ]]; then
+                echo "[!] Web assessment produced findings; see enum/web/assessments/."
+            else
+                echo "[!] Web assessment incomplete (exit $WEB_ASSESS_STATUS); inspect its report/logs."
+            fi
+        fi
+    else
+        echo "[!] Web assessment helper missing; initialize using the full repository checkout."
+    fi
+else
+    echo "[i] Web assessment disabled or no web URLs discovered."
+fi
+
+echo
+echo "=============================="
+echo "[+] 8. SMB enumeration"
+echo "=============================="
+show_progress 8 "SMB enumeration"
 
 if ports_lines | grep -Eq '^(139|445)$'; then
     SMB_PORTS="$(ports_lines | grep -E '^(139|445)$' | paste -sd, -)"
@@ -2102,9 +2051,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 8. FTP enumeration"
+echo "[+] 9. FTP enumeration"
 echo "=============================="
-show_progress 8 "FTP enumeration"
+show_progress 9 "FTP enumeration"
 
 if ports_lines | grep -q '^21$'; then
     run_with_timeout "$NMAP_MAXTIME" nmap \
@@ -2122,9 +2071,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 9. SSH enumeration"
+echo "[+] 10. SSH enumeration"
 echo "=============================="
-show_progress 9 "SSH enumeration"
+show_progress 10 "SSH enumeration"
 
 if ports_lines | grep -q '^22$'; then
     run_with_timeout "$NMAP_MAXTIME" nmap \
@@ -2140,9 +2089,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 10. NFS enumeration"
+echo "[+] 11. NFS enumeration"
 echo "=============================="
-show_progress 10 "NFS enumeration"
+show_progress 11 "NFS enumeration"
 
 if ports_lines | grep -Eq '^(111|2049)$'; then
     NFS_PORTS="$(ports_lines | grep -E '^(111|2049)$' | paste -sd, -)"
@@ -2161,9 +2110,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 11. RPC enumeration"
+echo "[+] 12. RPC enumeration"
 echo "=============================="
-show_progress 11 "RPC enumeration"
+show_progress 12 "RPC enumeration"
 
 if ports_lines | grep -q '^111$'; then
     if have rpcinfo; then
@@ -2179,9 +2128,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 12. SNMP enumeration"
+echo "[+] 13. SNMP enumeration"
 echo "=============================="
-show_progress 12 "SNMP enumeration"
+show_progress 13 "SNMP enumeration"
 
 if grep -q '161/udp.*open' scans/udp-top100.txt 2>/dev/null; then
     if have onesixtyone; then
@@ -2207,9 +2156,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 13. LDAP enumeration"
+echo "[+] 14. LDAP enumeration"
 echo "=============================="
-show_progress 13 "LDAP enumeration"
+show_progress 14 "LDAP enumeration"
 
 if ports_lines | grep -Eq '^(389|636|3268|3269)$'; then
     LDAP_PORTS="$(ports_lines | grep -E '^(389|636|3268|3269)$' | paste -sd, -)"
@@ -2229,9 +2178,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 14. Kerberos enumeration"
+echo "[+] 15. Kerberos enumeration"
 echo "=============================="
-show_progress 14 "Kerberos enumeration"
+show_progress 15 "Kerberos enumeration"
 
 if ports_lines | grep -q '^88$'; then
     run_with_timeout "$NMAP_MAXTIME" nmap \
@@ -2242,9 +2191,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 15. WinRM enumeration"
+echo "[+] 16. WinRM enumeration"
 echo "=============================="
-show_progress 15 "WinRM enumeration"
+show_progress 16 "WinRM enumeration"
 
 if ports_lines | grep -Eq '^(5985|5986)$'; then
     WINRM_PORTS="$(ports_lines | grep -E '^(5985|5986)$' | paste -sd, -)"
@@ -2267,9 +2216,9 @@ fi
 
 echo
 echo "=============================="
-echo "[+] 16. Generate port summary"
+echo "[+] 17. Generate port summary"
 echo "=============================="
-show_progress 16 "Generate port summary"
+show_progress 17 "Generate port summary"
 
 {
     echo "# Port Summary"
@@ -2289,22 +2238,24 @@ show_progress 16 "Generate port summary"
 
 echo
 echo "========================================="
-echo "[+] 17. Optional vulnerability Nmap scan"
+echo "[+] 18. Optional vulnerability Nmap scan"
 echo "========================================="
-show_progress 17 "Nmap vulnerability scan"
+show_progress 18 "Nmap vulnerability scan"
 
 echo "[+] This scan can be slow/noisy. Treat results as hints."
 echo "[+] Service detection is enabled so version-dependent scripts such as Vulners can run."
+# NSE does not reuse version/CPE information from the earlier invocation.
 run_with_timeout "$NMAP_MAXTIME" nmap \
-    -sV --script vuln -Pn -p "$PORTS" "$IP" -oN scans/tcp-vuln.txt || true
+    -sV --script vuln -Pn -p "$PORTS" "$IP" \
+    -oN scans/tcp-vuln.txt -oX scans/tcp-vuln.xml || true
 
 echo
 echo "=============================="
-echo "[+] 18. Interesting grep"
+echo "[+] 19. Interesting grep"
 echo "=============================="
-show_progress 18 "Interesting-result extraction"
+show_progress 19 "Interesting-result extraction"
 
-grep -RniI \
+grep -RniIE \
     --exclude="interesting-grep.txt" \
     --exclude="summary.md" \
     --exclude="recon-console.log" \
@@ -2322,9 +2273,9 @@ grep -RniI \
 
 echo
 echo "=============================="
-echo "[+] 19. Generate recon summary"
+echo "[+] 20. Generate recon summary"
 echo "=============================="
-show_progress 19 "Generate recon summary"
+show_progress 20 "Generate recon summary"
 
 {
     echo "# Recon Summary - $BOX"
@@ -2392,7 +2343,7 @@ show_progress 19 "Generate recon summary"
     echo
     echo "## Interesting Web Headers"
     echo
-    grep -RniI \
+    grep -RniIE \
         --exclude="*.map" \
         --exclude="*tailwind*" \
         --exclude="*polyfills*" \
@@ -2431,9 +2382,9 @@ show_progress 19 "Generate recon summary"
 
 echo
 echo "========================================"
-echo "[+] 20. Online OSV/NVD vulnerability intel"
+echo "[+] 21. Online OSV/NVD vulnerability intel"
 echo "========================================"
-show_progress 20 "Online OSV/NVD vulnerability intelligence"
+show_progress 21 "Online OSV/NVD vulnerability intelligence"
 
 run_online_vuln_analysis
 
@@ -2460,9 +2411,9 @@ echo "    writeup.md"
 
 echo
 echo "=============================="
-echo "[+] 21. Creating recon archive"
+echo "[+] 22. Creating recon archive"
 echo "=============================="
-show_progress 21 "Create recon archive"
+show_progress 22 "Create recon archive"
 
 if ! run_with_timeout "$ARCHIVE_MAXTIME" ./zip-recon.sh; then
     echo "[!] WARNING: Recon archive creation failed."
@@ -2606,6 +2557,8 @@ less summary.md
 * notes.md - working notes
 * writeup.md - final report/writeup
 * recon.sh - automated first-stage recon
+* web-assess.sh - bounded HTTP template and query DAST checks, plus OWASP review checklist
+* enum/web/assessments/ - independent web assessment runs, findings and stage logs
 * search-recon.sh - search collected recon and optionally copy matched files
 * file-hunt.sh - find readable files by name pattern and copy matches to loot
 * update-hosts.sh - update /etc/hosts for this box
@@ -2641,7 +2594,11 @@ Default recon is conservative to avoid ffuf/ferox loops on dynamic targets.
 ./recon.sh
 
 # Disable all heavy web fuzzing
-WEB_ENUM=0 ./recon.sh
+WEB_ENUM=0 WEB_ASSESS=0 ./recon.sh
+
+# Run web assessment independently; preview targets without network access
+./web-assess.sh --dry-run
+./web-assess.sh --insecure --oast
 
 # Run ferox but without extension multiplication or collect-backups
 FEROX_EXTENSIONS=0 FEROX_COLLECT=0 ./recon.sh
@@ -2655,9 +2612,9 @@ NIKTO_MAXTIME=300 NUCLEI_MAXTIME=300 ./recon.sh
 NMAP_MAXTIME=600 SERVICE_ENUM_MAXTIME=180 ./recon.sh
 UPDATE_SCANNER_DATA=0 ./recon.sh
 
-# Active DAST is bounded and enabled for the first web target by default
-MAX_DAST_TARGETS=2 DAST_MAXTIME=300 WAPITI_MAXTIME=300 ./recon.sh
-WEB_DAST=0 ./recon.sh
+# Scope-aware web assessment runs automatically after web/vhost discovery
+WEB_ASSESS_MAXTIME=2100 ./recon.sh
+WEB_ASSESS=0 ./recon.sh
 
 # Online OSV/NVD enrichment runs by default after collection
 ONLINE_VULN_CHECK=0 ./recon.sh

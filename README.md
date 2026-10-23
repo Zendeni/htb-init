@@ -104,30 +104,26 @@ stage continues. Stage updates include percentage and elapsed time.
 The main safety limits (in seconds) are `NMAP_MAXTIME=900`,
 `SERVICE_ENUM_MAXTIME=300`, `WEB_PROBE_MAXTIME=120`, `FEROX_MAXTIME=240`,
 `FFUF_MAXTIME=180`, `NIKTO_MAXTIME=600`, `NUCLEI_MAXTIME=600`,
-`DAST_MAXTIME=300`, `WAPITI_MAXTIME=300`, `ANALYZER_MAXTIME=900`, and
+`WEB_ASSESS_MAXTIME=2100`, `ANALYZER_MAXTIME=900`, and
 `ARCHIVE_MAXTIME=300`. Override any of them for one run, for example:
 
 ```bash
 NMAP_MAXTIME=600 NIKTO_MAXTIME=300 NUCLEI_MAXTIME=300 ./recon.sh
 ```
 
-When a web application is found, active DAST is enabled for the first web
-target by default. Nuclei runs its low-aggression fuzzing templates, including
-XSS, SQL injection, command injection, LFI/RFI, SSRF, SSTI, redirects, and XXE
-classes. If Wapiti is installed, a bounded complementary scan checks its common
-injection, file, upload, CSRF, and method modules. These are active requests and
-may submit payloads or use external callback services, so use this workflow only
-on an authorized lab target. Increase `MAX_DAST_TARGETS`, or disable the pass:
+When a web application is found, the scope-aware web assessment described
+below runs automatically after hostname discovery. Its crawler and two Nuclei
+stages are internally bounded, and the collector also applies an outer hard
+deadline. Disable it independently when only basic reconnaissance is wanted:
 
 ```bash
-MAX_DAST_TARGETS=2 ./recon.sh
-WEB_DAST=0 ./recon.sh
+WEB_ASSESS_MAXTIME=2100 ./recon.sh
+WEB_ASSESS=0 ./recon.sh
 ```
 
-At startup, the collector refreshes Nuclei templates and Wapiti attack modules,
-then rebuilds Nmap's local NSE script index. Nikto performs its own built-in
-update check when scanning. The preflight is bounded and can be disabled for a
-repeatable offline run:
+At startup, the collector refreshes Nuclei templates and rebuilds Nmap's local
+NSE script index. Nikto performs its own built-in update check when scanning.
+The preflight is bounded and can be disabled for a repeatable offline run:
 
 ```bash
 UPDATE_SCANNER_DATA=0 ./recon.sh
@@ -165,6 +161,8 @@ VHOST_SUFFIXES=htb,vl,local,test ./recon.sh
 | `ANALYSIS.md` | Local instructions for the shared analysis workflow |
 | `tools/analyze-recon.py` | Bundled legacy analyzer used for automatic OSV/NVD enrichment |
 | `recon-analysis.md` | Online vulnerability-intelligence report produced by `recon.sh` |
+| `web-assess.sh`, `web-assess.py` | Scope-aware active HTTP template and query-parameter DAST workflow |
+| `enum/web/assessments/` | Separate web-assessment reports, findings, inventories, and stage logs |
 | `scans/`, `enum/` | Existing collected artifacts |
 | `reports/` | Separate review snapshots; excluded from subsequent evidence imports |
 | `notes.md`, `writeup.md` | Your working notes and final writeup |
@@ -206,6 +204,86 @@ ScopeLens supports existing Nmap XML/text, httpx JSONL/text, saved HTTP headers,
 Reports retain source locations and hashes, and redact common secret patterns. Redaction is best effort: review reports before sharing. Raw workspace archives preserve original evidence and can contain sensitive material. Analysis reports are stored separately and are not automatically included in those archives.
 
 Changes between reports describe differences in supplied evidence. A removed finding can reflect changed collection or parser coverage and does not by itself prove remediation.
+
+## Web application assessment
+
+New workspaces include `web-assess.sh` and `web-assess.py`. Use the full checkout
+when initializing: the Python helper must sit beside `htb-init.sh` to be copied.
+Existing workspaces can use `python3 /path/to/htb-init/web-assess.py --workspace /path/to/workspace`.
+This is an **active** collection step, separate from offline ScopeLens review.
+Running `recon.sh` starts it after web/vhost discovery; `WEB_ASSESS=0` disables it.
+
+Install [ProjectDiscovery Nuclei](https://docs.projectdiscovery.io/opensource/nuclei/install)
+and its signed community templates before running the collector:
+
+```bash
+nuclei -version
+nuclei -update-templates
+# The helper auto-detects ~/.local/nuclei-templates or ~/nuclei-templates;
+# override with --templates or NUCLEI_TEMPLATES.
+./web-assess.sh --dry-run
+./web-assess.sh
+```
+
+The script reads `enum/web/live-web-urls.txt` and
+`enum/web/discovered-host-web-urls.txt`, validates explicit scope, performs a
+bounded same-origin HTML crawl, and runs two distinct Nuclei stages:
+
+- Signed HTTP templates for known XSS, XXE, SSRF, CVEs, exposed files, CORS,
+  misconfiguration and other checks present in the installed template set.
+- DAST templates against query parameters discovered in links and GET forms,
+  or supplied in an endpoint list. DAST must be enabled explicitly in Nuclei;
+  the helper supplies `-dast` automatically.
+
+It saves the selected template inventory, commands, JSONL findings, logs,
+`report.json` and `report.md` in a fresh `enum/web/assessments/<run>/` directory.
+No templates, missing tools, timeouts, malformed findings and failed stages are
+reported as incomplete. Exit codes: `0` completed/planned, `1` findings, `2`
+invalid or incomplete assessment, `130` interrupted. A completed run describes
+the selected automation only; skipped checks and the manual checklist remain.
+
+```bash
+# Review discovered scope before scanning. scope.json exclusions always win.
+./web-assess.sh --dry-run
+# Include a discovered vhost explicitly; ensure it resolves to the lab IP.
+./web-assess.sh --allow-host app.example.htb --url 'http://app.example.htb:8080/'
+# Supply parameterized URLs or a newline-delimited endpoint list.
+./web-assess.sh --url 'http://example.htb/search?q=test'
+./web-assess.sh --urls-file endpoints.txt --no-crawl
+# Allow lab self-signed TLS for the crawler; enable blind callback tests.
+./web-assess.sh --insecure --oast
+# Tune request volume and deadlines.
+./web-assess.sh --rate-limit 5 --concurrency 1 --max-pages 20 --scan-timeout 1800
+```
+
+`scope.json` is authoritative when present; otherwise literal `IP` and `HOST`
+values in `.target.env` establish scope without sourcing shell code. This
+collector requires nonempty included scope, unlike the offline evidence filter.
+`--allow-host` adds exact names/IPs; wildcard/suffix matching is not implicit.
+Automatic URL lists skip excluded/unknown hosts with diagnostics; explicit
+out-of-scope inputs fail. Explicit URL options replace the discovery lists.
+Redirects are disabled in Nuclei, and the crawler follows only included origins.
+Templates are trusted scanner code: this is target filtering, not a network
+sandbox. Update your trusted template checkout separately; scans do not request
+updates. The generated empty config prevents user defaults changing the plan.
+
+Defaults: 10 requests/second, 2 concurrent templates, 30 crawl pages, 200
+endpoints, 120 seconds for crawling, 900 seconds per scan stage. The crawler
+does not submit forms or render JavaScript; discovered query endpoints are
+passed to DAST. Nuclei handles its own TLS validation behavior; `--insecure`
+controls only the Python crawler. `--no-crawl` and `--no-dast` disable those steps.
+DoS/brute-force and headless/code checks are excluded. OAST is off by default;
+`--oast` enables Interactsh callbacks, including public callback infrastructure.
+Blind SSRF/XXE checks need callback connectivity from the target.
+
+**Coverage is partial, never a full OWASP certification.** Each report contains
+an [OWASP Top 10:2025](https://owasp.org/Top10/2025/) manual checklist. Known XXE
+templates can test specific products, but arbitrary XML bodies need captured
+requests and parser-specific testing. POST/JSON body fuzzing, stored/DOM XSS,
+authenticated authorization/IDOR, session logic, business rules, supply-chain
+integrity, cryptography at rest and server-side logging need additional review.
+Use Burp/ZAP with representative requests/accounts for those paths. The report
+keeps these gaps visible even when no automated finding is returned.
 
 ## Earlier workflow
 

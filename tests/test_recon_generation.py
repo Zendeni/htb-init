@@ -1,4 +1,4 @@
-"""Regression tests for generated online vulnerability-intelligence stages."""
+"""Regression tests for generated recon safety and vulnerability stages."""
 
 import os
 from pathlib import Path
@@ -36,15 +36,15 @@ class ReconGenerationTests(unittest.TestCase):
             workspace = labs_root / "example"
             recon = (workspace / "recon.sh").read_text(encoding="utf-8")
             archive = (workspace / "zip-recon.sh").read_text(encoding="utf-8")
+            assessor = (workspace / "web-assess.py").read_text(encoding="utf-8")
 
             self.assertIn('ONLINE_VULN_CHECK="${ONLINE_VULN_CHECK:-1}"', recon)
             self.assertIn('VHOST_SUFFIXES="${VHOST_SUFFIXES:-htb,vl,local}"', recon)
             self.assertIn("is_vhost_base_candidate", recon)
             self.assertIn('NIKTO_MAXTIME="${NIKTO_MAXTIME:-600}"', recon)
             self.assertIn('NUCLEI_MAXTIME="${NUCLEI_MAXTIME:-600}"', recon)
-            self.assertIn('WEB_DAST="${WEB_DAST:-1}"', recon)
-            self.assertIn('DAST_MAXTIME="${DAST_MAXTIME:-300}"', recon)
-            self.assertIn('WAPITI_MAXTIME="${WAPITI_MAXTIME:-300}"', recon)
+            self.assertIn('WEB_ASSESS="${WEB_ASSESS:-1}"', recon)
+            self.assertIn('WEB_ASSESS_MAXTIME="${WEB_ASSESS_MAXTIME:-2100}"', recon)
             self.assertIn('NMAP_MAXTIME="${NMAP_MAXTIME:-900}"', recon)
             self.assertIn('SERVICE_ENUM_MAXTIME="${SERVICE_ENUM_MAXTIME:-300}"', recon)
             self.assertIn('WEB_PROBE_MAXTIME="${WEB_PROBE_MAXTIME:-120}"', recon)
@@ -53,24 +53,26 @@ class ReconGenerationTests(unittest.TestCase):
             self.assertIn('UPDATE_SCANNER_DATA="${UPDATE_SCANNER_DATA:-1}"', recon)
             self.assertIn("refresh_scanner_data", recon)
             self.assertIn("nuclei -update-templates", recon)
-            self.assertIn("wapiti --update", recon)
             self.assertIn('timeout --signal=TERM --kill-after=10', recon)
             self.assertIn('run_with_timeout "$NIKTO_MAXTIME" nikto', recon)
             self.assertIn('run_with_timeout "$NUCLEI_MAXTIME" nuclei', recon)
             self.assertIn('run_with_timeout "$NMAP_MAXTIME" nmap', recon)
             self.assertIn('run_with_timeout "$ANALYZER_MAXTIME" python3', recon)
             self.assertIn('run_with_timeout "$ARCHIVE_MAXTIME" ./zip-recon.sh', recon)
+            self.assertIn('run_with_timeout "$WEB_ASSESS_MAXTIME" bash ./web-assess.sh', recon)
             self.assertIn("-sV --script vuln", recon)
-            self.assertIn('run_with_timeout "$DAST_MAXTIME" nuclei', recon)
-            self.assertIn('run_with_timeout "$WAPITI_MAXTIME" wapiti', recon)
-            self.assertIn("-dast", recon)
-            self.assertIn("sql,ssrf,upload,xss,xxe", recon)
+            self.assertIn('"-dast"', assessor)
+            self.assertIn("SSRF", assessor)
+            self.assertIn("XXE", assessor)
+            self.assertIn("XSS", assessor)
             self.assertIn("run_online_vuln_analysis", recon)
             self.assertIn("--online-vuln-check", recon)
-            self.assertIn("show_progress 21", recon)
+            self.assertIn("show_progress 22", recon)
             self.assertIn("Progress: 100%", recon)
             self.assertIn("recon-analysis.md", archive)
+            self.assertIn("web-assess.py", archive)
             self.assertTrue((workspace / "tools" / "analyze-recon.py").is_file())
+            self.assertTrue((workspace / "web-assess.sh").is_file())
 
             syntax = subprocess.run(
                 [BASH, "-n", str(workspace / "recon.sh")],
