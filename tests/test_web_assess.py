@@ -236,6 +236,7 @@ class WebAssessmentCLITests(unittest.TestCase):
             argv.append("--no-crawl")
         with mock.patch.object(WEB_ASSESS.shutil, "which", return_value="fake-nuclei" if installed else None), \
                 mock.patch.object(WEB_ASSESS.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(WEB_ASSESS, "preflight", return_value=[{"origin": "https://example.test", "reachable": True, "status": 200}]), \
                 mock.patch.object(WEB_ASSESS, "crawl", return_value=(["https://example.test/search?a=1&b=2"], crawl_info)), \
                 mock.patch.object(WEB_ASSESS.urllib.request, "build_opener", side_effect=AssertionError("Network access is forbidden")), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -257,14 +258,15 @@ class WebAssessmentCLITests(unittest.TestCase):
         code, report, _ = self.active("--no-dast", records=json.dumps(finding) + "\n")
         self.assertEqual(code, 1)
         self.assertEqual(report["status"], "completed")
-        self.assertEqual(report["findings"], [finding])
+        self.assertEqual({key: report["findings"][0][key] for key in finding}, finding)
+        self.assertTrue(Path(report["findings"][0]["evidence_file"]).is_file())
 
     def test_scanner_failure_takes_precedence_over_findings_exit_status(self):
         finding = {"template-id": "fixture-xxe"}
         code, report, _ = self.active("--no-dast", records=json.dumps(finding) + "\n", scan_code=3)
         self.assertEqual(code, 2)
         self.assertEqual(report["status"], "incomplete")
-        self.assertEqual(report["findings"], [finding])
+        self.assertEqual(report["findings"][0]["template-id"], finding["template-id"])
 
     def test_missing_scanner_writes_an_incomplete_report(self):
         code, report, calls = self.active(installed=False)
@@ -305,7 +307,12 @@ class WebAssessmentCLITests(unittest.TestCase):
             self.assertTrue(config.is_relative_to(self.web / "assessments"))
             self.assertEqual(config.read_text(encoding="utf-8"), "{}\n")
             target_file = Path(scan[scan.index("-l") + 1])
-            self.assertEqual(target_file.read_text(encoding="utf-8"), "https://example.test/search?a=1&b=2\n")
+            if "-dast" in scan:
+                self.assertEqual(scan[scan.index("-im") + 1], "burp")
+                captures = WEB_ASSESS.load_requests([target_file], WEB_ASSESS.Scope(self.workspace, []))
+                self.assertEqual([item["url"] for item in captures], ["https://example.test/search?a=1&b=2"])
+            else:
+                self.assertEqual(target_file.read_text(encoding="utf-8"), "https://example.test/search?a=1&b=2\n")
             self.assertFalse(scan_options.get("shell", False))
             self.assertFalse(inventory_options.get("shell", False))
         http, dast = [s for s in report["stages"] if "command" in s]
@@ -455,13 +462,13 @@ class WebCrawlerTests(unittest.TestCase):
     def test_links_and_get_forms_are_collected_without_submitting_forms(self):
         endpoints, info = self.crawl()
         self.assertEqual(info["diagnostics"], [])
-        self.assertCountEqual(self.requests, ["/", "/one"])
+        self.assertCountEqual(self.requests, ["/", "/one", "/search?a=1&b=2"])
         self.assertCountEqual(endpoints, [
             self.base + "/", self.base + "/one", self.base + "/search?a=1&b=2",
-            self.base + "/find?query=hello+world",
         ])
         self.assertEqual(len(info["forms"]), 2)
-        self.assertEqual(info["forms"][0]["field_names"], ["query"])
+        self.assertEqual(info["forms"][0]["field_names"], ["query", "csrf", "password"])
+        self.assertTrue(all(form["status"] == "prepared" for form in info["forms"]))
         self.assertNotIn("secret", json.dumps(info))
 
     def test_redirects_are_checked_before_following_same_origin(self):
@@ -472,7 +479,7 @@ class WebCrawlerTests(unittest.TestCase):
 
     def test_external_redirect_is_never_followed(self):
         endpoints, info = self.crawl("/external-redirect")
-        self.assertEqual(info["diagnostics"], [])
+        self.assertIn("Blocked redirect", " ".join(info["diagnostics"]))
         self.assertEqual(self.requests, ["/external-redirect"])
         self.assertEqual(endpoints, [self.base + "/external-redirect"])
 

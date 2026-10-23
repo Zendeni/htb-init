@@ -94,9 +94,12 @@ command:
 
 Its vulnerability stage enables Nmap service detection before the `vuln`
 script category, allowing version-dependent scripts such as Vulners to query
-current online intelligence. After collection, the bundled legacy analyzer
-queries OSV and NVD for detected packages and technologies and writes
-`recon-analysis.md`. Nuclei and Nikto continue to provide template-based web
+current online intelligence. After collection, the bundled analyzer writes
+**`overview.md`**: up to three evidence-backed attack paths, the next test for
+each, and any important coverage gaps. Start there. `overview.json` contains
+the same structured decisions; `recon-analysis.md` retains the supporting
+detail. Online OSV/NVD enrichment adds version-based research candidates.
+Nuclei and Nikto continue to provide template-based web
 checks. Every external network scanner has a time ceiling. A
 timed-out command receives `TERM`, then `KILL` after ten seconds, and the next
 stage continues. Stage updates include percentage and elapsed time.
@@ -132,7 +135,8 @@ UPDATE_SCANNER_DATA=0 ./recon.sh
 The collector deliberately does not upgrade scanner binaries or operating-system
 packages; manage those separately with the host's package manager.
 
-Online enrichment is enabled by default. Disable it for an offline collection:
+Online enrichment is enabled by default. Disable the analyzer's API lookups
+while retaining the local evidence analysis and overview:
 
 ```bash
 ONLINE_VULN_CHECK=0 ./recon.sh
@@ -142,6 +146,18 @@ Online matches are research leads, not proof of exploitability. Distribution
 backports, broad product matches, and incomplete version fingerprints can all
 produce false positives.
 
+The overview distinguishes scanner matches from version-based candidates and
+does not promote a product name or an unexecuted template to a vulnerability.
+Routes retain the affected endpoint, source evidence, confidence, prerequisites
+and a concrete verification step. A partial scan is reported as partial, even
+when the scanners that finished returned no findings.
+
+Before a new collection starts, preflight checks run without changing previous
+evidence. A successful start archives the previous collection under `runs/`
+and creates fresh `scans/` and `enum/` directories. `run-status.json` and
+`run-stages.tsv` record command outcomes, including failures and timeouts.
+Concurrent collectors in the same workspace are rejected.
+
 Vhost namespace discovery accepts HTB-style suffixes (`htb`, `vl`, and
 `local`) by default so external links found in page content are not fuzzed as
 target namespaces. Extend the list when a lab uses another suffix:
@@ -149,6 +165,26 @@ target namespaces. Extend the list when a lab uses another suffix:
 ```bash
 VHOST_SUFFIXES=htb,vl,local,test ./recon.sh
 ```
+
+## Windows HTB targets from Kali
+
+Use the same `htb-init.sh <box> <ip>` and `./recon.sh` workflow for Windows
+targets. The collector selects SMB, LDAP/LDAPS, Kerberos, WinRM, RDP and MSSQL
+enumeration from discovered ports and service fingerprints. It saves Nmap XML
+alongside readable output so domain names, hostnames, access results and
+vulnerability matches retain their source evidence. RDP and MSSQL checks gather
+service/NTLM information; LDAPS-only targets are queried on their actual TLS port.
+
+The short overview prioritizes explicit vulnerability matches and observed
+access, such as an anonymously readable SMB share or directory objects returned
+without credentials. A share name, an open RDP/WinRM port or public LDAP RootDSE
+metadata alone is not a vulnerability. SMB signing observations are conditional
+research leads with prerequisites, not proof that relay will work. Windows
+build numbers also do not establish missing security patches.
+
+Web applications on Windows use the same scoped HTTP and session-aware input
+testing. This supports scanning Windows targets **from Kali/Linux**; the full
+collector still requires Bash and its external Linux reconnaissance tools.
 
 ## Files you will use
 
@@ -160,8 +196,11 @@ VHOST_SUFFIXES=htb,vl,local,test ./recon.sh
 | `inspect.sh` | Inspect artifact coverage and saved reports |
 | `ANALYSIS.md` | Local instructions for the shared analysis workflow |
 | `tools/analyze-recon.py` | Bundled legacy analyzer used for automatic OSV/NVD enrichment |
-| `recon-analysis.md` | Online vulnerability-intelligence report produced by `recon.sh` |
-| `web-assess.sh`, `web-assess.py` | Scope-aware active HTTP template and query-parameter DAST workflow |
+| `overview.md`, `overview.json` | Short, ranked attack paths and coverage gaps; read these first |
+| `recon-analysis.md` | Detailed local evidence analysis and optional vulnerability intelligence |
+| `run-status.json`, `run-stages.tsv` | Current collection identity, command outcomes and completion status |
+| `runs/` | Previous collections, preserved before fresh scans start |
+| `web-assess.sh`, `web-assess.py` | Scope-aware HTTP templates and session-aware request/input testing |
 | `enum/web/assessments/` | Separate web-assessment reports, findings, inventories, and stage logs |
 | `scans/`, `enum/` | Existing collected artifacts |
 | `reports/` | Separate review snapshots; excluded from subsequent evidence imports |
@@ -231,9 +270,9 @@ bounded same-origin HTML crawl, and runs two distinct Nuclei stages:
 
 - Signed HTTP templates for known XSS, XXE, SSRF, CVEs, exposed files, CORS,
   misconfiguration and other checks present in the installed template set.
-- DAST templates against query parameters discovered in links and GET forms,
-  or supplied in an endpoint list. DAST must be enabled explicitly in Nuclei;
-  the helper supplies `-dast` automatically.
+- DAST templates against discovered query inputs, usable GET/POST forms, and
+  captured requests. The helper preserves request methods, bodies, cookies and
+  exact-origin authentication, and supplies Nuclei's required `-dast` flag.
 
 It saves the selected template inventory, commands, JSONL findings, logs,
 `report.json` and `report.md` in a fresh `enum/web/assessments/<run>/` directory.
@@ -256,6 +295,57 @@ the selected automation only; skipped checks and the manual checklist remain.
 ./web-assess.sh --rate-limit 5 --concurrency 1 --max-pages 20 --scan-timeout 1800
 ```
 
+For an authenticated application, supply a session file. Authentication is bound
+to the exact origin, including scheme and port; it is not reused across vhosts
+or redirects. The crawler also preserves cookies issued during navigation.
+
+```json
+{
+  "origins": {
+    "https://example.htb": {
+      "headers": {"Authorization": "Bearer REPLACE_WITH_LAB_TOKEN"},
+      "cookies": {"session": "REPLACE_WITH_LAB_SESSION"}
+    }
+  }
+}
+```
+
+Capture requests for APIs or inputs that navigation cannot discover. A request
+file accepts JSON as below, or Burp XML exports. Keep the actual content type,
+method and body. All request targets must pass the same explicit scope checks.
+
+```json
+{
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://example.htb/api/search",
+      "headers": {"Content-Type": "application/json"},
+      "body": "{\"query\":\"example\"}"
+    }
+  ]
+}
+```
+
+```bash
+./web-assess.sh --session-file session.json --requests-file requests.json
+# Forward the same inputs through the one-launch collector:
+WEB_SESSION_FILE="$PWD/session.json" WEB_REQUESTS_FILE="$PWD/requests.json" ./recon.sh
+```
+
+Request inventories can contain session cookies, authorization headers and
+hidden form tokens. Keep them local; generated raw request files use owner-only
+permissions on Unix. Short overviews omit those values. Static session material
+does not implement a login workflow or refresh single-use CSRF tokens: expired
+authentication, unsupported forms and untested inputs must be reviewed in the
+coverage section.
+
+The DAST stage uses these sessions and captured requests. The separate generic
+HTTP-template stage remains unauthenticated. Baseline requests check for denied
+access before fuzzing; they can submit POST requests. Approved vhost aliases
+must resolve locally: curl `--resolve` mappings from discovery are not inherited
+by Nuclei. Unresolvable origins are recorded as incomplete coverage.
+
 `scope.json` is authoritative when present; otherwise literal `IP` and `HOST`
 values in `.target.env` establish scope without sourcing shell code. This
 collector requires nonempty included scope, unlike the offline evidence filter.
@@ -269,17 +359,22 @@ updates. The generated empty config prevents user defaults changing the plan.
 
 Defaults: 10 requests/second, 2 concurrent templates, 30 crawl pages, 200
 endpoints, 120 seconds for crawling, 900 seconds per scan stage. The crawler
-does not submit forms or render JavaScript; discovered query endpoints are
-passed to DAST. Nuclei handles its own TLS validation behavior; `--insecure`
+follows query navigation and captures forms without submitting them; the active
+DAST stage tests usable captured inputs. It does not render JavaScript.
+Nuclei handles its own TLS validation behavior; `--insecure`
 controls only the Python crawler. `--no-crawl` and `--no-dast` disable those steps.
 DoS/brute-force and headless/code checks are excluded. OAST is off by default;
 `--oast` enables Interactsh callbacks, including public callback infrastructure.
 Blind SSRF/XXE checks need callback connectivity from the target.
+Nuclei excludes whole templates that require Interactsh when OAST is disabled;
+this can also omit their in-band XXE payloads. The saved template inventory is
+the authority for what was selected.
 
 **Coverage is partial, never a full OWASP certification.** Each report contains
 an [OWASP Top 10:2025](https://owasp.org/Top10/2025/) manual checklist. Known XXE
 templates can test specific products, but arbitrary XML bodies need captured
-requests and parser-specific testing. POST/JSON body fuzzing, stored/DOM XSS,
+requests and compatible templates; a body being captured does not establish
+that every injection class was exercised. Stored/DOM XSS,
 authenticated authorization/IDOR, session logic, business rules, supply-chain
 integrity, cryptography at rest and server-side logging need additional review.
 Use Burp/ZAP with representative requests/accounts for those paths. The report
@@ -302,4 +397,20 @@ bash -n htb-init.sh
 python -m unittest discover -s tests -v
 ```
 
-The integration tests exercise preparation, inspection, reporting, threshold and error statuses, copied entrypoints, and untrusted metadata using synthetic local artifacts. They do not run collection. CI installs a pinned ScopeLens revision so the tested pairing is explicit. When changing the shared interface, test both repositories and update that pin together.
+The integration tests exercise preparation, inspection, reporting, threshold and error statuses, copied entrypoints, and untrusted metadata using synthetic local artifacts. CI installs a pinned ScopeLens revision so the tested pairing is explicit. When changing the shared interface, test both repositories and update that pin together.
+
+Collector regressions run generated scripts with mock scanners and online
+enrichment disabled. For a separate acceptance test using the real Nuclei
+engine and a local trusted template checkout:
+
+```bash
+python tests/run_nuclei_acceptance.py \
+  --nuclei /path/to/nuclei --templates /path/to/nuclei-templates \
+  --output /tmp/htb-acceptance
+```
+
+This starts disposable loopback fixtures, tests cookie-preserving navigation,
+POST forms with hidden CSRF fields, authenticated JSON/XML requests, positive
+and negative injection responses, unreachable-target reporting, and the final
+attack-path report. It uses signed templates already present locally, disables
+updates and OAST, and does not scan a real lab target.

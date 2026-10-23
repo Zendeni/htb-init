@@ -27,7 +27,10 @@ from __future__ import annotations
 
 import argparse
 import html
+import hashlib
+import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -39,6 +42,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +57,7 @@ DEFAULT_VULN_CACHE = Path.home() / ".cache" / "htb-recon" / "vuln-cache.json"
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{vuln_id}"
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CACHE_TTL_SECONDS = 86400
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -190,13 +196,13 @@ OFFLINE_CVE_RULES: list[dict[str, object]] = [
     {
         "id": "CVE-2024-22120",
         "product": "Zabbix",
-        "severity": "HIGH/CRITICAL candidate",
+        "severity": "HIGH",
         "confidence": "medium",
         "impact_keywords": ["remote code execution", "rce", "sql injection", "command execution"],
         "version_ranges": ["6.0.0-6.0.27", "6.4.0-6.4.12", "7.0.0alpha1-7.0.0beta1"],
         "hints": ["zabbix", "10050", "10051", "api_jsonrpc.php", "/zabbix"],
         "title": "Zabbix Server audit log clientip SQL injection / RCE-chain research candidate",
-        "summary": "Possible Zabbix exposure was detected. Research CVE-2024-22120 after confirming Zabbix Server/frontend/API access and version. Do not treat this as confirmed vulnerable without version and access validation.",
+        "summary": "Affected Zabbix Server audit logging may permit SQL injection. Requires a low-privilege account with access to at least one host. Agent or frontend version alone does not establish this Server vulnerability.",
         "references": [
             "https://support.zabbix.com/browse/ZBX-24505",
             "https://nvd.nist.gov/vuln/detail/CVE-2024-22120",
@@ -248,6 +254,35 @@ class VulnMatch:
     aliases: list[str] = field(default_factory=list)
     relevance: int = 0
     reason: str = ""
+    target: str = ""
+    evidence: list[dict] = field(default_factory=list)
+    status: str = "advisory-candidate"
+    prerequisites: list[str] = field(default_factory=list)
+    next_test: str = "Confirm affected component, deployment and prerequisites."
+    request_method: str = ""
+    parameter: str = ""
+    parameter_position: str = ""
+    session_present: bool = False
+    context: dict = field(default_factory=dict)
+
+
+@dataclass
+class ServiceObservation:
+    """Host-attributed service facts; access is distinct from a vulnerability."""
+    service: str
+    kind: str
+    target: str
+    status: str
+    evidence: list[dict] = field(default_factory=list)
+    resource: str = ""
+    access: str = ""
+    platform: str = "unknown"
+    domain: str = ""
+    hostname: str = ""
+    product: str = ""
+    version: str = ""
+    detail: str = ""
+    tls: bool = False
 
 
 @dataclass
@@ -279,6 +314,16 @@ class ReconData:
     package_versions: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     vuln_matches: list[VulnMatch] = field(default_factory=list)
     vuln_errors: list[str] = field(default_factory=list)
+    scanner_matches: list[VulnMatch] = field(default_factory=list)
+    coverage: list[str] = field(default_factory=list)
+    package_evidence: dict[str, list[dict]] = field(default_factory=lambda: defaultdict(list))
+    scope_include: list[str] = field(default_factory=list)
+    scope_exclude: list[str] = field(default_factory=list)
+    zabbix_server_versions: set[str] = field(default_factory=set)
+    latest_assessment: str = ""
+    assessment_status: str = "not-collected"
+    assessment_limits: list[str] = field(default_factory=list)
+    service_observations: list[ServiceObservation] = field(default_factory=list)
 
 
 def strip_ansi(s: str) -> str:
@@ -419,6 +464,9 @@ def iter_text_files(root: Path) -> Iterable[Path]:
         "dist",
         "build",
         "screenshots",
+        "runs",
+        "reports",
+        "tools",
     }
     allowed_suffixes = {
         ".txt",
@@ -563,6 +611,8 @@ def infer_tech_from_ports(data: ReconData) -> None:
 def detect_product_versions_from_text(data: ReconData, text: str, rel: str = "") -> None:
     """Extract non-package product versions from banners, HTML, logs, and notes."""
     low_rel = rel.lower()
+    for match in re.finditer(r"\bZabbix\s+Server[/'\s:-]*(\d+\.\d+(?:\.\d+)?(?:alpha\d+|beta\d+|rc\d+)?)", text, re.I):
+        data.zabbix_server_versions.add(match.group(1))
 
     for match in ZABBIX_VERSION_RE.finditer(text):
         version = match.group(1).strip().rstrip(".,;:)]}")
@@ -586,13 +636,14 @@ def version_in_range(version: str, affected_range: str) -> Optional[bool]:
     if not version or "-" not in affected_range:
         return None
     start, end = affected_range.split("-", 1)
-    if re.search(r"(?i)(alpha|beta|rc)", version + start + end):
-        # Pre-release ordering is easy to get subtly wrong. Keep it manual.
-        return None
-    try:
-        return version_tuple(start) <= version_tuple(version) <= version_tuple(end)
-    except Exception:
-        return None
+    def key(value):
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:(alpha|beta|rc)(\d+))?", value, re.I)
+        if not match:
+            return None
+        major, minor, patch, label, sequence = match.groups()
+        return (int(major), int(minor), int(patch), {"alpha": 0, "beta": 1, "rc": 2, None: 3}[label.lower() if label else None], int(sequence or 0))
+    values = [key(v) for v in (start, version, end)]
+    return values[0] <= values[1] <= values[2] if all(v is not None for v in values) else None
 
 
 def cve_rule_matches(data: ReconData, rule: dict[str, object]) -> tuple[bool, str, str]:
@@ -606,19 +657,23 @@ def cve_rule_matches(data: ReconData, rule: dict[str, object]) -> tuple[bool, st
     hint_hits = [h for h in hints if h in haystack]
 
     detected_versions = []
+    if product == "zabbix":
+        detected_versions = list(data.zabbix_server_versions)
+        if not detected_versions:
+            return False, "low", "Zabbix Server version not established; Agent/Frontend versions are insufficient"
     for key, versions in data.package_versions.items():
-        if product and product in key.lower():
+        if product != "zabbix" and product and product in key.lower():
             detected_versions.extend(v for v in versions if v)
     for tech in data.technologies:
-        if product and product in tech.lower():
+        if product != "zabbix" and product and product in tech.lower():
             detected_versions.extend(re.findall(r"\b\d+\.\d+(?:\.\d+)?[0-9A-Za-z.\-+]*", tech))
 
     for version in sorted(set(detected_versions)):
         checks = [version_in_range(version, r) for r in version_ranges]
         if True in checks:
             return True, "high", f"{rule.get('product')} version {version} falls in affected range"
-        if checks and all(c is False for c in checks):
-            return False, "low", f"{rule.get('product')} version {version} appears outside configured affected ranges"
+    if detected_versions and all(all(version_in_range(v, r) is False for r in version_ranges) for v in detected_versions):
+        return False, "low", f"{rule.get('product')} versions are outside configured affected ranges"
 
     if product_seen and hint_hits:
         return True, str(rule.get("confidence", "medium")), "product and local hints matched; version unknown"
@@ -644,6 +699,17 @@ def offline_cve_hints(data: ReconData) -> list[VulnMatch]:
                 version = next((v for v in sorted(versions) if v), "")
                 break
 
+        evidence, target = [], ""
+        if product.lower() == "zabbix":
+            version = next((v for v in sorted(data.zabbix_server_versions) if any(version_in_range(v, r) is True for r in rule.get("version_ranges", []))), "")
+            for rel, content in data.files.items():
+                if not (rel.startswith("scans/") or (rel.startswith("enum/web/") and raw_web_evidence(rel))):
+                    continue
+                needle = re.search(r"\bZabbix\s+Server[/'\s:-]*" + re.escape(version) + r"\b", content, re.I) if version else None
+                if needle:
+                    evidence.append(source_evidence(data, rel, needle=needle.group(0)))
+                    target = evidence_origin(data, content) if rel.startswith("enum/web/") else data.ip or data.host
+
         matches.append(score_vuln_match(data, VulnMatch(
             source="LOCAL-RULE",
             vuln_id=str(rule.get("id", "unknown")),
@@ -657,6 +723,9 @@ def offline_cve_hints(data: ReconData) -> list[VulnMatch]:
             references=[str(r) for r in rule.get("references", [])],
             aliases=[str(rule.get("id", ""))] if rule.get("id") else [],
             reason=reason,
+            evidence=evidence, target=target,
+            prerequisites=["A low-privilege Zabbix account with access to at least one host is required; access is not established."],
+            next_test="Confirm Zabbix Server build and available account/host permissions against ZBX-24505.",
         )))
     return matches
 
@@ -690,7 +759,6 @@ def parse_markdown_port_table_line(data: ReconData, line: str) -> None:
 def parse_ports(data: ReconData) -> None:
     candidates = [
         "scans/port-summary.md",
-        "summary.md",
         "scans/tcp-services.txt",
         "scans/tcp-full.txt",
         "scans/tcp-aggressive.txt",
@@ -916,7 +984,7 @@ def detect_nextjs_from_text(data: ReconData, text: str, rel: str = "") -> None:
         data.technologies.add(f"Next.js {version}")
 
         snippet = match.group(0)
-        if re.search(r"appDir\s*:\s*(?:true|!0|!1|1)", snippet):
+        if re.search(r"appDir\s*:\s*(?:true|!0|1)(?=\s*[,}])", snippet):
             data.nextjs_app_router = True
             data.rsc_indicators.add("window.next appDir enabled")
 
@@ -932,7 +1000,7 @@ def detect_nextjs_from_text(data: ReconData, text: str, rel: str = "") -> None:
             data.nextjs_versions.add(version)
             data.technologies.add(f"Next.js {version}")
 
-    if re.search(r"""appDir\s*:\s*(?:true|!0|1)""", text):
+    if re.search(r"""appDir\s*:\s*(?:true|!0|1)(?=\s*[,}])""", text):
         data.nextjs_app_router = True
         data.rsc_indicators.add("appDir enabled")
 
@@ -1088,14 +1156,17 @@ def looks_like_nextjs(data: ReconData) -> bool:
 def parse_web(data: ReconData) -> None:
     combined_web = []
     for rel, text in data.files.items():
-        if rel.startswith("enum/web/") or rel in (
-            "summary.md",
+        if (rel.startswith("enum/web/") and raw_web_evidence(rel)) or rel in (
             "scans/tcp-services.txt",
             "scans/tcp-aggressive.txt",
         ):
             combined_web.append((rel, text))
 
     for rel, text in combined_web:
+        if rel.startswith("scans/"):
+            # NSE script prose is parsed separately as typed findings. Its
+            # advisory descriptions are not service/product fingerprints.
+            text = "\n".join(line for line in text.splitlines() if NMAP_OPEN_RE.match(line) or line.startswith("Service Info:"))
         collect_urls = (
             rel.endswith("live-web-urls.txt")
             or "whatweb" in rel.lower()
@@ -1113,7 +1184,8 @@ def parse_web(data: ReconData) -> None:
                 if re.match(r"^https?://[a-z](?:[#/:?@]|$)", low_url):
                     continue
 
-                data.web_urls.add(url)
+                if in_scope(data, url):
+                    data.web_urls.add(url)
 
         if rel.startswith("enum/web/"):
             for endpoint in API_PATH_RE.findall(text):
@@ -1143,6 +1215,13 @@ def parse_web(data: ReconData) -> None:
         collect_nikto_noise(data, text)
         detect_tech_from_text(data, text, rel)
         detect_product_versions_from_text(data, text, rel)
+        if rel.startswith("enum/web/"):
+            local = ReconData(root=data.root, source=data.source)
+            detect_nextjs_from_text(local, text, rel)
+            target = evidence_origin(data, text)
+            for package, versions in (("next", local.nextjs_versions), ("react", local.react_versions)):
+                for version in versions:
+                    add_package(data, "npm", package, version, evidence=source_evidence(data, rel), target=target, kind="observed")
 
 
 def normalize_web_ports(data: ReconData) -> None:
@@ -1163,7 +1242,7 @@ def normalize_web_ports(data: ReconData) -> None:
 
 def parse_smb(data: ReconData) -> None:
     for rel, text in data.files.items():
-        if not rel.startswith("enum/smb/") and rel != "summary.md":
+        if not rel.startswith("enum/smb/"):
             continue
 
         for line in text.splitlines():
@@ -1186,7 +1265,7 @@ def parse_ad_dns_ldap(data: ReconData) -> None:
     for rel, text in data.files.items():
         if not (
             rel.startswith(("enum/ldap/", "enum/dns/"))
-            or rel in ("summary.md", "scans/tcp-services.txt", "scans/tcp-aggressive.txt")
+            or rel in ("scans/tcp-services.txt", "scans/tcp-aggressive.txt")
         ):
             continue
 
@@ -1216,6 +1295,8 @@ def parse_interesting(data: ReconData) -> None:
     seen = set()
 
     for rel, text in data.files.items():
+        if "assessments/" in rel or rel.endswith(".log") or "templates" in Path(rel).name:
+            continue
         if rel == "enum/interesting-grep.txt":
             candidates = text.splitlines()
         elif rel.startswith(("loot/", "enum/")):
@@ -1242,7 +1323,7 @@ def parse_interesting(data: ReconData) -> None:
 
 
 
-def add_package(data: ReconData, ecosystem: str, name: str, version: str = "") -> None:
+def add_package(data: ReconData, ecosystem: str, name: str, version: str = "", *, evidence: Optional[dict] = None, target: str = "", kind: str = "unattributed") -> None:
     ecosystem = ecosystem.strip()
     name = name.strip()
     version = str(version).strip().lstrip("v")
@@ -1253,6 +1334,10 @@ def add_package(data: ReconData, ecosystem: str, name: str, version: str = "") -
         data.package_versions[key].add(version)
     else:
         data.package_versions[key].add("")
+    if evidence:
+        record = {"version": version, "target": target, "kind": kind, "evidence": evidence}
+        if record not in data.package_evidence[key]:
+            data.package_evidence[key].append(record)
 
 
 def parse_package_files(data: ReconData) -> None:
@@ -1270,7 +1355,7 @@ def parse_package_files(data: ReconData) -> None:
                 continue
             if not isinstance(obj, dict):
                 continue
-            for block in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            for block in ("dependencies", "devDependencies", "optionalDependencies"):
                 deps = obj.get(block, {})
                 if isinstance(deps, dict):
                     for pkg, ver in deps.items():
@@ -1278,7 +1363,7 @@ def parse_package_files(data: ReconData) -> None:
                         # version. Only a complete exact semver may feed OSV.
                         ver = str(ver).strip()
                         if re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", ver):
-                            add_package(data, "npm", pkg, ver)
+                            add_package(data, "npm", pkg, ver, evidence=source_evidence(data, rel, needle=pkg), kind="dev-declared" if block == "devDependencies" else "declared")
         elif name in {"package-lock.json", "npm-shrinkwrap.json"}:
             try:
                 obj = json.loads(text)
@@ -1299,20 +1384,20 @@ def parse_package_files(data: ReconData) -> None:
                         # nested dependencies and workspace installations. OSV
                         # needs the registry name (with its optional @scope).
                         pkg = pkg_path.rsplit("node_modules/", 1)[1]
-                        add_package(data, "npm", pkg, version)
+                        add_package(data, "npm", pkg, version, evidence=source_evidence(data, rel, needle=pkg_path), kind="dev-locked" if meta.get("dev") else "locked")
             deps = obj.get("dependencies", {})
             if isinstance(deps, dict):
                 for pkg, meta in deps.items():
                     if isinstance(meta, dict) and meta.get("version"):
-                        add_package(data, "npm", pkg, str(meta["version"]))
+                        add_package(data, "npm", pkg, str(meta["version"]), evidence=source_evidence(data, rel, needle=pkg), kind="dev-locked" if meta.get("dev") else "locked")
         elif name == "requirements.txt":
             for line in text.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                m = re.match(r"([A-Za-z0-9_.\-]+)==([A-Za-z0-9_.!+\-]+)", line)
+                m = re.fullmatch(r"([A-Za-z0-9_.\-]+)==([0-9][A-Za-z0-9_.!+\-]*)(?:\s+#.*)?", line)
                 if m:
-                    add_package(data, "PyPI", m.group(1), m.group(2))
+                    add_package(data, "PyPI", m.group(1), m.group(2), evidence=source_evidence(data, rel, needle=line), kind="declared")
         elif name == "composer.lock":
             try:
                 obj = json.loads(text)
@@ -1357,7 +1442,8 @@ def parse_package_files(data: ReconData) -> None:
 def cache_load(path: Path) -> dict:
     try:
         if path.is_file():
-            return json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
     except Exception:
         return {}
     return {}
@@ -1366,6 +1452,19 @@ def cache_load(path: Path) -> dict:
 def cache_save(path: Path, cache: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def cached_response(cache: dict, key: str):
+    item = cache.get(key)
+    if not isinstance(item, dict) or not isinstance(item.get("cached_at"), (int, float)):
+        return None
+    if not 0 <= time.time() - item["cached_at"] <= CACHE_TTL_SECONDS:
+        return None
+    return item.get("response")
+
+
+def cache_response(cache: dict, key: str, response) -> None:
+    cache[key] = {"cached_at": time.time(), "response": response}
 
 
 def http_json(method: str, url: str, payload: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> dict:
@@ -1398,15 +1497,43 @@ def first_text(value, limit: int = 180) -> str:
 
 def severity_rank(severity: str) -> int:
     s = (severity or "").lower()
-    if "critical" in s or "10." in s or s.startswith("10"):
+    if re.search(r"\bcritical\b", s):
         return 0
-    if "high" in s or re.search(r"\b[789](?:\.\d+)?\b", s):
+    if re.search(r"\bhigh\b", s):
         return 1
-    if "medium" in s or re.search(r"\b[456](?:\.\d+)?\b", s):
+    if re.search(r"\b(?:medium|moderate)\b", s):
         return 2
-    if "low" in s or re.search(r"\b[123](?:\.\d+)?\b", s):
+    if re.search(r"\blow\b", s):
         return 3
-    return 4
+    score = cvss_score(s)
+    return 4 if score is None else 0 if score >= 9 else 1 if score >= 7 else 2 if score >= 4 else 3 if score > 0 else 4
+
+
+def cvss_score(value: str) -> Optional[float]:
+    """Compute supported CVSS 3 base vectors; unknown versions stay unknown."""
+    value = value.upper().strip()
+    if re.fullmatch(r"(?:10(?:\.0)?|[0-9](?:\.[0-9])?)", value):
+        return float(value)
+    vector = re.search(r"CVSS:3\.[01]/([^\s]+)", value)
+    if not vector:
+        return None
+    try:
+        entries = vector.group(1).split("/")
+        metrics = dict(entry.split(":", 1) for entry in entries)
+        if len(metrics) != len(entries):
+            return None
+        scope = metrics["S"]
+        if scope not in {"U", "C"}:
+            return None
+        values = {"H": .56, "L": .22, "N": 0}
+        iss = 1 - math.prod(1 - values[metrics[x]] for x in "CIA")
+        impact = 6.42 * iss if scope == "U" else 7.52 * (iss - .029) - 3.25 * (iss - .02) ** 15
+        exploitability = 8.22 * {"N": .85, "A": .62, "L": .55, "P": .2}[metrics["AV"]] * {"L": .77, "H": .44}[metrics["AC"]]
+        exploitability *= {"N": .85, "L": .62 if scope == "U" else .68, "H": .27 if scope == "U" else .5}[metrics["PR"]] * {"N": .85, "R": .62}[metrics["UI"]]
+        score = min((impact + exploitability) * (1 if scope == "U" else 1.08), 10) if impact > 0 else 0
+        return math.ceil((score - 1e-10) * 10) / 10
+    except (KeyError, ValueError):
+        return None
 
 
 def extract_reference_urls(value) -> list[str]:
@@ -1505,10 +1632,10 @@ def enrich_osv_vuln(vuln: dict, cache: dict, timeout: int = 20) -> dict:
 
     cache_key = f"osv-detail:{vuln_id}"
     try:
-        detail = cache.get(cache_key)
+        detail = cached_response(cache, cache_key)
         if detail is None:
             detail = http_json("GET", OSV_VULN_URL.format(vuln_id=urllib.parse.quote(vuln_id)), timeout=timeout)
-            cache[cache_key] = detail
+            cache_response(cache, cache_key, detail)
             time.sleep(0.15)
         if isinstance(detail, dict):
             merged = dict(vuln)
@@ -1527,12 +1654,16 @@ def match_text(m: VulnMatch) -> str:
 
 def score_vuln_match(data: ReconData, m: VulnMatch) -> VulnMatch:
     text = match_text(m)
-    score = 0
-    reasons = []
+    # Evidence class always dominates severity. A keyword CVE cannot outrank a
+    # reproduced endpoint match, regardless of its headline CVSS score.
+    score = 1000 if m.status == "scanner-match" else 0
+    if m.source == "SERVICE-EVIDENCE":
+        score = 600 if m.status == "access-observed" else 100
+    reasons = [m.reason] if m.reason else []
 
     if m.source == "OSV" and m.ecosystem and m.package and m.version:
-        score += 40
-        reasons.append("exact OSV package/version match")
+        score += 200 if m.target and m.evidence else 40
+        reasons.append("exact OSV package/version match; deployment and prerequisites require validation")
     elif m.source == "NVD":
         score += 15
         reasons.append("NVD keyword match")
@@ -1544,35 +1675,16 @@ def score_vuln_match(data: ReconData, m: VulnMatch) -> VulnMatch:
         score += 18
         reasons.append("high severity")
 
-    if looks_like_nextjs(data) and ("next" in text or "react" in text):
-        score += 15
-        reasons.append("matches detected Next.js/React stack")
-
-    if has_technology(data, "zabbix") and "zabbix" in text:
-        score += 20
-        reasons.append("matches detected Zabbix candidate")
-
     if m.source == "LOCAL-RULE":
-        score += 20
-        reasons.append("local port/service CVE rule matched")
+        score += 150 if m.target and m.evidence and m.confidence == "high" else 20
+        reasons.append("local affected-component rule")
 
-    if data.nextjs_app_router and ("app router" in text or "server components" in text or "rsc" in text):
-        score += 20
-        reasons.append("App Router/RSC condition is locally confirmed")
-
-    if data.rsc_indicators and ("server components" in text or "rsc" in text or "flight" in text):
-        score += 20
-        reasons.append("RSC behavior is locally confirmed")
-
-    if any(token in text for token in ("remote code execution", "rce", "code execution", "command execution")):
+    if re.search(r"\b(?:remote code execution|rce|code execution|command execution)\b", text):
         score += 18
         reasons.append("RCE/code execution impact")
 
-    if any(token in text for token in ("cross-site scripting", "xss", "denial of service", "dos")):
-        score -= 8
-
     m.relevance = score
-    m.reason = "; ".join(reasons)
+    m.reason = "; ".join(dict.fromkeys(part for reason in reasons for part in reason.split("; ")))
     return m
 
 
@@ -1604,7 +1716,14 @@ def extract_osv_matches(data: ReconData, response: dict, queries: list[dict], ca
             title = extract_osv_title(vuln)
             summary = first_text(vuln.get("details") or vuln.get("summary") or title, 700)
 
-            out.append(score_vuln_match(data, VulnMatch(
+            provenance = [row for row in data.package_evidence.get(f"{ecosystem}:{name}", []) if row["version"] == version]
+            observed = [row for row in provenance if row["kind"] == "observed" and in_scope(data, row["target"])]
+            # Source/lockfile evidence proves a dependency declaration, not the
+            # version executing at any discovered web endpoint.
+            targets = sorted({row["target"] for row in observed}) or [""]
+            for target in targets:
+                evidence = [row["evidence"] for row in (observed if target else provenance) if not target or row["target"] == target]
+                out.append(score_vuln_match(data, VulnMatch(
                 source="OSV",
                 vuln_id=vuln_id,
                 title=title,
@@ -1612,10 +1731,13 @@ def extract_osv_matches(data: ReconData, response: dict, queries: list[dict], ca
                 package=name,
                 ecosystem=ecosystem,
                 version=version,
-                confidence="high",
+                confidence="medium" if target else "low",
                 summary=summary,
                 references=refs[:8],
                 aliases=aliases,
+                target=target, evidence=evidence,
+                prerequisites=["Confirm the running version, affected feature and advisory prerequisites."],
+                reason="Deployed response version observed." if target else "Dependency declaration/lockfile only; deployment is not established.",
             )))
     return out
 
@@ -1643,11 +1765,10 @@ def run_osv_lookup(data: ReconData, cache: dict, timeout: int = 20) -> list[Vuln
     for idx in range(0, len(queries), 100):
         batch = queries[idx:idx + 100]
         cache_key = "osv:" + json.dumps(batch, sort_keys=True)
-        if cache_key in cache:
-            response = cache[cache_key]
-        else:
+        response = cached_response(cache, cache_key)
+        if response is None:
             response = http_json("POST", OSV_BATCH_URL, {"queries": batch}, timeout=timeout)
-            cache[cache_key] = response
+            cache_response(cache, cache_key, response)
             time.sleep(0.2)
         matches.extend(extract_osv_matches(data, response, batch, cache, timeout=timeout))
     return matches
@@ -1655,6 +1776,11 @@ def run_osv_lookup(data: ReconData, cache: dict, timeout: int = 20) -> list[Vuln
 
 def nvd_keyword_terms(data: ReconData) -> list[str]:
     terms = []
+    # Service banners are research keywords only. A build number does not
+    # establish patch level, affected deployment or exploit prerequisites.
+    for observation in data.service_observations:
+        if observation.kind == "service-fingerprint" and observation.version and re.search(r"\b(?:IIS|SQL Server)\b", observation.product, re.I):
+            terms.append(f"{observation.product} {observation.version}")
     for key, versions in sorted(data.package_versions.items()):
         ecosystem, name = key.split(":", 1)
         if ecosystem.lower() == "npm" and name in {"next", "react", "react-server-dom-webpack"}:
@@ -1773,12 +1899,11 @@ def run_nvd_lookup(data: ReconData, cache: dict, timeout: int = 20, api_key: str
             "resultsPerPage": str(max_results),
         }
         url = NVD_CVE_URL + "?" + urllib.parse.urlencode(params)
-        cache_key = "nvd:" + term
-        if cache_key in cache:
-            response = cache[cache_key]
-        else:
+        cache_key = "nvd:" + url
+        response = cached_response(cache, cache_key)
+        if response is None:
             response = http_json("GET", url, headers=headers, timeout=timeout)
-            cache[cache_key] = response
+            cache_response(cache, cache_key, response)
             time.sleep(0.7 if api_key else 6.2)  # NVD public rate limit is stricter without an API key.
         matches.extend(extract_nvd_matches(data, response, term, max_results))
     return matches
@@ -1788,7 +1913,7 @@ def dedupe_vuln_matches(matches: list[VulnMatch]) -> list[VulnMatch]:
     merged: dict[tuple[str, str, str, str], VulnMatch] = {}
 
     for m in matches:
-        key = (m.source, m.vuln_id, m.package, m.version)
+        key = (m.source, m.vuln_id, m.package, m.version, m.target, m.request_method, m.parameter, m.parameter_position)
         existing = merged.get(key)
         if not existing:
             merged[key] = m
@@ -1803,6 +1928,7 @@ def dedupe_vuln_matches(matches: list[VulnMatch]) -> list[VulnMatch]:
             existing.summary = m.summary
         existing.references = list(dict.fromkeys(existing.references + m.references))[:8]
         existing.aliases = list(dict.fromkeys(existing.aliases + m.aliases))[:8]
+        existing.evidence.extend(e for e in m.evidence if e not in existing.evidence)
         existing.relevance = max(existing.relevance, m.relevance)
         if not existing.reason and m.reason:
             existing.reason = m.reason
@@ -1818,7 +1944,7 @@ def dedupe_vuln_matches(matches: list[VulnMatch]) -> list[VulnMatch]:
 
 def run_vulnerability_intel(data: ReconData, online: bool, cache_path: Path, timeout: int, nvd_api_key: str, max_results: int) -> None:
     parse_package_files(data)
-    matches: list[VulnMatch] = offline_cve_hints(data)
+    matches: list[VulnMatch] = list(data.scanner_matches) + offline_cve_hints(data)
     if not online:
         data.vuln_matches = dedupe_vuln_matches(matches)[:80]
         return
@@ -1837,6 +1963,478 @@ def run_vulnerability_intel(data: ReconData, online: bool, cache_path: Path, tim
     except Exception as exc:
         data.vuln_errors.append(f"Vulnerability cache save failed: {exc}")
 
+def raw_web_evidence(rel: str) -> bool:
+    """Only captured responses/discovery output may supply technology facts."""
+    low = rel.lower()
+    name = Path(low).name
+    return not (
+        "/assessments/" in low or "/runs/" in low
+        or any(token in name for token in ("nuclei", "nikto", "templates", "report", "overview", "summary", "technology-profile", "interesting-grep"))
+        or low.endswith((".log", ".jsonl", ".md"))
+    )
+
+
+def source_evidence(data: ReconData, rel: str, line: int = 1, needle: str = "", locator: str = "") -> dict:
+    content = data.files.get(rel, "")
+    if needle:
+        line = next((i for i, value in enumerate(content.splitlines(), 1) if needle in value), line)
+    return {"path": rel, "line": line, "locator": locator,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+
+
+def scope_host(value: str) -> str:
+    try:
+        if "://" in value:
+            return (urllib.parse.urlsplit(value).hostname or "").lower().rstrip(".")
+        return value.strip().strip("[]").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def in_scope(data: ReconData, target: str) -> bool:
+    host = scope_host(target)
+    if not host:
+        return False
+    def matches(entry: str) -> bool:
+        try:
+            return ipaddress.ip_address(host) in ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            return host == scope_host(entry)
+    include = data.scope_include or [v for v in (data.ip, data.host) if v]
+    return any(matches(v) for v in include) and not any(matches(v) for v in data.scope_exclude)
+
+
+def initialize_scope(data: ReconData) -> None:
+    if "scope.json" in data.files:
+        try:
+            scope = json.loads(data.files["scope.json"])
+            if not isinstance(scope, dict) or not isinstance(scope.get("include"), list) or not isinstance(scope.get("exclude", []), list):
+                raise ValueError("include/exclude must be arrays")
+            if not all(isinstance(v, str) and v for v in scope["include"] + scope.get("exclude", [])):
+                raise ValueError("scope entries must be nonempty strings")
+            # An explicit empty scope must not silently fall back to target metadata.
+            data.scope_include = scope["include"] or ["<empty-scope>"]
+            data.scope_exclude = scope.get("exclude", [])
+        except (ValueError, TypeError):
+            data.scope_include = ["<invalid-scope>"]
+            data.coverage.append("Invalid scope.json: no attack routes can be attributed safely.")
+    else:
+        data.scope_include = [v for v in (data.ip, data.host) if v]
+    if not data.scope_include:
+        data.coverage.append("Target scope is missing; findings cannot be promoted to attack routes.")
+
+
+def evidence_origin(data: ReconData, text: str) -> str:
+    # A recorded response URL is stronger than hyperlinks in its body. Never
+    # attach an unattributed JS bundle to one of several discovered applications.
+    recorded = re.findall(r"(?im)^(?:URL|Target|Request URL):\s*(https?://\S+)", text)
+    def origins(values):
+        found = set()
+        for url in values:
+            if in_scope(data, url):
+                parsed = urllib.parse.urlsplit(url)
+                found.add(f"{parsed.scheme}://{parsed.netloc}")
+        return found
+    explicit = origins(recorded)
+    if len(explicit) == 1:
+        return next(iter(explicit))
+    if explicit:
+        return ""
+    # Fallback is safe only when the current discovery set has a single origin.
+    known = origins(data.web_urls)
+    return next(iter(known)) if len(known) == 1 else ""
+
+
+def parse_collection_status(data: ReconData) -> None:
+    try:
+        status = json.loads(data.files.get("run-status.json", "{}"))
+    except (ValueError, TypeError):
+        status = {}
+    if not isinstance(status, dict) or status.get("status") != "completed":
+        data.coverage.append("Collection completeness is unverified or incomplete.")
+    if isinstance(status, dict):
+        for stage in as_list(status.get("stages")):
+            if isinstance(stage, dict) and stage.get("status") not in ("completed", "success", "ok"):
+                name = str(stage.get("name") or stage.get("stage") or "collection")
+                data.coverage.append(f"{name}: {stage.get('status', 'unknown')}.")
+
+
+def nuclei_match(data: ReconData, item: dict, rel: str, line: int, locator: str = "") -> Optional[VulnMatch]:
+    template = str(item.get("template-id") or item.get("template_id") or "")
+    target = str(item.get("matched-at") or item.get("matched_at") or item.get("url") or item.get("endpoint") or "")
+    if not template or item.get("matcher-status") is False or not in_scope(data, target):
+        return None
+    info = item.get("info") if isinstance(item.get("info"), dict) else item
+    classification = info.get("classification") if isinstance(info.get("classification"), dict) else {}
+    aliases = [str(v) for v in as_list(classification.get("cve-id")) if re.fullmatch(r"CVE-\d{4}-\d+", str(v), re.I)]
+    evidence = source_evidence(data, rel, line, locator=locator or template)
+    request = str(item.get("request") or "")
+    method = str(item.get("fuzzing_method") or "").upper()
+    if not method:
+        request_line = re.match(r"^([A-Z]+)\s+\S+\s+HTTP/", request)
+        method = request_line.group(1) if request_line else ""
+    method = method if method in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"} else ""
+    parameter = str(item.get("fuzzing_parameter") or "")
+    parameter = parameter[:80] if re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", parameter) else ""
+    position = str(item.get("fuzzing_position") or "")
+    position = position if position in {"query", "body", "header", "cookie", "path"} else ""
+    session_present = bool(re.search(r"(?im)^(?:Authorization|Cookie):", request.split("\r\n\r\n", 1)[0]))
+    prerequisites = ["Reproduce the match and rule out a template false positive."]
+    if session_present:
+        prerequisites.append("Preserve the captured session; required authentication is not established.")
+    endpoint = urllib.parse.urlsplit(public_target(target)).path or "/"
+    next_test = f"Replay {method + ' ' if method else ''}{endpoint}"
+    next_test += f" {position + ' ' if position else ''}field {parameter}" if parameter else " matched input"
+    next_test += " against a harmless baseline; compare the response."
+    return VulnMatch(
+        source="NUCLEI", vuln_id=template, title=first_text(info.get("name") or template, 160),
+        severity=str(info.get("severity") or "unknown"), confidence="medium",
+        summary=first_text(info.get("description"), 700), aliases=aliases,
+        references=extract_reference_urls(info.get("reference")), target=target, evidence=[evidence],
+        status="scanner-match", reason="Template matcher reported a hit at this endpoint; manual confirmation remains required.",
+        prerequisites=prerequisites, next_test=next_test,
+        request_method=method, parameter=parameter, parameter_position=position, session_present=session_present,
+    )
+
+
+def parse_web_assessment(data: ReconData) -> None:
+    prefix = "enum/web/assessments/"
+    runs = {rel[len(prefix):].split("/", 1)[0] for rel in data.files if rel.startswith(prefix) and "/" in rel[len(prefix):]}
+    if not runs:
+        data.coverage.append("No current structured web assessment is available.")
+        return
+    # Run directory names begin with sortable UTC timestamps. Never fall back
+    # to an older successful run when the newest attempt is partial or empty.
+    pointer_path = prefix + "latest.json"
+    if pointer_path in data.files:
+        try:
+            pointer = json.loads(data.files[pointer_path])
+            selected = pointer["run_id"]
+            if not isinstance(selected, str) or selected not in runs:
+                raise ValueError("missing run")
+        except (ValueError, TypeError, KeyError):
+            data.coverage.append("Latest web assessment pointer is invalid; older findings were not reused.")
+            return
+    else:
+        selected = max(runs)
+        if sum(run[:15] == selected[:15] for run in runs) > 1:
+            data.coverage.append("Latest web assessment is ambiguous; same-second runs require latest.json.")
+            return
+    data.latest_assessment = prefix + selected
+    report_path = data.latest_assessment + "/report.json"
+    try:
+        report = json.loads(data.files.get(report_path, "{}"))
+        if not isinstance(report, dict):
+            raise ValueError("report is not an object")
+    except (ValueError, TypeError):
+        report = {}
+        data.coverage.append("Current web report is unreadable.")
+    data.assessment_status = str(report.get("status", "incomplete"))
+    data.assessment_limits = [first_text(item, 700) for item in as_list(report.get("limits")) if isinstance(item, str)]
+    if any("unauthenticated" in item.lower() for item in data.assessment_limits):
+        data.coverage.append("Known HTTP templates ran without authentication; captured sessions apply to DAST requests.")
+    if data.assessment_status != "completed":
+        data.coverage.append(f"Current web assessment: {data.assessment_status}.")
+    for stage in as_list(report.get("stages")):
+        if isinstance(stage, dict) and stage.get("status") != "completed":
+            data.coverage.append(f"Web {stage.get('name', 'stage')}: {stage.get('status', 'unknown')} ({stage.get('reason') or stage.get('error') or 'coverage incomplete'}).")
+    if not report.get("oast_enabled"):
+        data.coverage.append("Blind callback-based SSRF/XXE checks were not enabled.")
+    # Read only stage finding files, never inventories, stdout, or report prose.
+    raw_paths = sorted(rel for rel in data.files if rel.startswith(data.latest_assessment + "/") and Path(rel).name in {"http.jsonl", "dast.jsonl", "nuclei.jsonl"})
+    for rel in raw_paths:
+        for line, text in enumerate(data.files[rel].splitlines(), 1):
+            if not text.strip():
+                continue
+            try:
+                item = json.loads(text)
+                if not isinstance(item, dict):
+                    raise ValueError("finding is not an object")
+                match = nuclei_match(data, item, rel, line)
+                if match:
+                    data.scanner_matches.append(score_vuln_match(data, match))
+            except (ValueError, TypeError):
+                data.coverage.append(f"Unparsed finding at {rel}:{line}.")
+    if not raw_paths:
+        for index, item in enumerate(as_list(report.get("findings"))):
+            if isinstance(item, dict):
+                match = nuclei_match(data, item, report_path, 1, f"findings[{index}]")
+                if match:
+                    data.scanner_matches.append(score_vuln_match(data, match))
+
+
+def nse_match(data: ReconData, target: str, script: str, output: str, rel: str, line: int, locator: str = "") -> None:
+    if not in_scope(data, target):
+        return
+    aliases = list(dict.fromkeys(re.findall(r"\bCVE-\d{4}-\d+\b", output, re.I)))
+    vulnerable = bool(re.search(r"(?im)^\s*(?:State:\s*)?VULNERABLE\s*:?\s*$", output))
+    if not aliases and not vulnerable:
+        return
+    # vulners/vulscan enumerate version-based candidates, not behavior checks.
+    status = "scanner-match" if vulnerable and script.lower() not in {"vulners", "vulscan"} else "advisory-candidate"
+    if re.search(r"\bNOT VULNERABLE\b", output, re.I):
+        return
+    severity_match = re.search(r"Risk factor:\s*(CRITICAL|HIGH|MEDIUM|LOW)", output, re.I)
+    severity = severity_match.group(1).lower() if severity_match else "unknown"
+    match = VulnMatch(source="NMAP-NSE", vuln_id=script, title=f"{script}: {'vulnerable response' if vulnerable else 'version-based CVE candidate'}",
+        severity=severity, target=target, aliases=aliases, confidence="medium" if vulnerable else "low", status=status,
+        evidence=[source_evidence(data, rel, line, locator=locator or script)],
+        reason="NSE reported VULNERABLE." if vulnerable else "NSE CVE listing needs affected-version and deployment validation.",
+        prerequisites=["Verify script applicability and reproduce the reported behavior."],
+        next_test="Review the NSE output and reproduce its non-destructive validation on this service.")
+    data.scanner_matches.append(score_vuln_match(data, match))
+
+
+def nmap_artifact(rel: str) -> bool:
+    return rel.startswith("scans/") or (rel.startswith(("enum/smb/", "enum/ldap/", "enum/rdp/", "enum/mssql/", "enum/winrm/", "enum/kerberos/")) and Path(rel).name.startswith("nmap-"))
+
+
+def observed_context(text: str) -> dict:
+    platform = "Samba" if re.search(r"\bSamba\b", text, re.I) else "Windows" if re.search(r"\bWindows\b", text, re.I) else "unknown"
+    def value(pattern):
+        match = re.search(pattern + r":\s*([^\r\n;]+)", text, re.I)
+        return first_text(match.group(1), 100) if match else ""
+    return {"platform": platform, "domain": value(r"(?:DNS_Domain_Name|Domain name|Domain)"),
+            "hostname": value(r"(?:DNS_Computer_Name|Computer name|NetBIOS_Computer_Name|FQDN)")}
+
+
+def record_service_observation(data: ReconData, observation: ServiceObservation) -> None:
+    if not in_scope(data, observation.target):
+        return
+    key = (observation.service, observation.kind, observation.target, observation.resource, observation.status)
+    for existing in data.service_observations:
+        if key == (existing.service, existing.kind, existing.target, existing.resource, existing.status):
+            existing.evidence.extend(row for row in observation.evidence if row not in existing.evidence)
+            for attribute in ("domain", "hostname", "product", "version", "detail"):
+                if not getattr(existing, attribute):
+                    setattr(existing, attribute, getattr(observation, attribute))
+            if existing.platform == "unknown":
+                existing.platform = observation.platform
+            return
+    data.service_observations.append(observation)
+
+
+def service_category(number: int, name: str, product: str = "") -> str:
+    value = (name + " " + product).lower()
+    # A product family can implement several protocols (e.g. Samba AD).
+    # Protocol detection takes precedence over product branding.
+    if "kerberos" in name.lower():
+        return "kerberos"
+    if re.search(r"ms-sql|microsoft sql server", value):
+        return "mssql"
+    if "ldap" in value:
+        return "ldap"
+    if re.search(r"microsoft-ds|netbios-ssn|\bsmb\b|samba", value):
+        return "smb"
+    if "ms-wbt" in value or "terminal services" in value:
+        return "rdp"
+    if "winrm" in value or "windows remote management" in value:
+        return "winrm"
+    if "kerberos" in value:
+        return "kerberos"
+    if re.search(r"\bIIS\b", product, re.I):
+        return "http"
+    if number in {5985, 5986} and "httpapi" in value:
+        return "winrm"
+    if name.strip().lower() in {"", "unknown", "tcpwrapped", "msrpc"} and not product:
+        return {139: "smb", 445: "smb", 389: "ldap", 636: "ldap", 3268: "ldap", 3269: "ldap", 3389: "rdp", 5985: "winrm", 5986: "winrm", 88: "kerberos", 1433: "mssql"}.get(number, "")
+    return ""
+
+
+def service_ports(data: ReconData, category: str) -> set[int]:
+    ports = {port.number for port in data.ports.values() if port.proto == "tcp" and service_category(port.number, port.service, port.version) == category}
+    for observation in data.service_observations:
+        if observation.service == category:
+            number = urllib.parse.urlsplit(observation.target).port
+            if number:
+                ports.add(number)
+    return ports
+
+
+def service_uses_tls(data: ReconData, number: int) -> bool:
+    port = data.ports.get((number, "tcp"))
+    if number in {636, 3269, 5986} or (port and (port.service.lower().startswith("ssl/") or port.service.lower() in {"ldaps", "https"})):
+        return True
+    return any(observed.tls and urllib.parse.urlsplit(observed.target).port == number for observed in data.service_observations)
+
+
+def observe_nmap_service(data: ReconData, address: str, number: int, protocol: str, service: str, product: str, version: str, rel: str, context: dict) -> None:
+    if protocol != "tcp" or not in_scope(data, address):
+        return
+    category = service_category(number, service, product)
+    if not category:
+        return
+    host = f"[{address}]" if ":" in address else address
+    tls = service.lower().startswith("ssl/") or service.lower() in {"ldaps", "https"} or number in {636, 3269, 5986}
+    target = f"{'ldaps' if category == 'ldap' and tls else category}://{host}:{number}"
+    record_service_observation(data, ServiceObservation(category, "service-fingerprint", target,
+        "service-observed" if product and not (category == "winrm" and "httpapi" in product.lower()) else "port-observed", product=product, version=version,
+        evidence=[source_evidence(data, rel, locator=f"host[{address}]/port[{number}]/service")], tls=tls, **context))
+
+
+def administrative_share(name: str) -> bool:
+    return name.lower() in {"admin$", "ipc$"} or bool(re.fullmatch(r"[a-zA-Z]\$", name))
+
+
+def observe_nmap_script(data: ReconData, target: str, script: str, output: str, rel: str, line: int,
+                        context: dict, invocation: str = "", locator: str = "") -> None:
+    if not in_scope(data, target):
+        return
+    parsed = urllib.parse.urlsplit(target if "://" in target else "//" + (f"[{target}]" if ":" in target else target))
+    host = parsed.hostname or target
+    host = f"[{host}]" if ":" in host else host
+    evidence = [source_evidence(data, rel, line, locator=locator or script)]
+    if script == "smb-enum-shares":
+        share, share_host = "", host
+        for value in output.splitlines():
+            unc = re.match(r"\s*\\\\([^\\]+)\\([^\\:]+):?\s*$", value)
+            bare = re.match(r"\s*([A-Za-z0-9_. $-]+):?\s*$", value)
+            if unc:
+                share_host, share = unc.groups()
+            elif bare and bare.group(1).strip():
+                share, share_host = bare.group(1).strip(), host
+            access = re.match(r"\s*Anonymous access:\s*(READ(?:/WRITE)?|READ ONLY)\s*$", value, re.I)
+            if access and share and not administrative_share(share) and in_scope(data, share_host):
+                port = parsed.port or 445
+                share_host = f"[{share_host}]" if ":" in share_host and not share_host.startswith("[") else share_host
+                endpoint = f"smb://{share_host}:{port}/{urllib.parse.quote(share, safe='') }"
+                record_service_observation(data, ServiceObservation("smb", "anonymous-share-access", endpoint, "access-observed",
+                    resource=share, access=access.group(1).upper(), evidence=evidence, **context))
+    if script in {"smb-security-mode", "smb2-security-mode"} and re.search(r"(?:signing[^\r\n]*(?:not required|disabled)|message_signing:\s*disabled)", output, re.I):
+        record_service_observation(data, ServiceObservation("smb", "signing-not-required", f"smb://{host}:{parsed.port or 445}",
+            "configuration-observed", evidence=evidence, detail="Signing is not required for at least one observed SMB dialect.", **context))
+    if script == "ldap-search":
+        objects = re.findall(r"(?im)^\s*dn:\s*((?:CN|OU|UID|DC)=[^\r\n]+)", output)
+        has_attributes = bool(re.search(r"(?im)^\s*(?:sAMAccountName|objectClass|uid|cn|operatingSystem|userPrincipalName):\s*\S", output))
+        if objects and has_attributes:
+            # ldap-search can reuse ldap-brute credentials from Nmap's registry.
+            # Missing invocation or a credentials file must remain unattributed.
+            anonymous = bool(re.search(r"--script(?:=|\s+)[^\r\n]*\bldap-search\b", invocation)) and not re.search(r"ldap\.(?:username|password)|brute|--script-args-file", invocation, re.I)
+            status = "access-observed" if anonymous else "authentication-unknown"
+            ldap_context = dict(context)
+            if not ldap_context["domain"]:
+                ldap_context["domain"] = ".".join(re.findall(r"(?:^|,)\s*DC=([^,]+)", objects[0], re.I))
+            record_service_observation(data, ServiceObservation("ldap", "anonymous-objects" if anonymous else "directory-objects",
+                f"{'ldaps' if parsed.scheme == 'tls' or parsed.port in {636, 3269} else 'ldap'}://{host}:{parsed.port or 389}", status, resource=f"{len(objects)} directory objects", access="anonymous" if anonymous else "unknown",
+                evidence=evidence, detail="Directory object attributes were returned; this may be intended public access.", **ldap_context))
+
+
+def parse_smb_access(data: ReconData) -> None:
+    """smbclient -L lists names only; only an explicit access test is a lead."""
+    for rel, text in data.files.items():
+        if not rel.startswith("enum/smb/") or not re.fullmatch(r"smbmap-null(?:-\d+)?\.txt", Path(rel).name):
+            continue
+        address, port = "", "445"
+        for line, value in enumerate(text.splitlines(), 1):
+            match = re.search(r"\bIP:\s*(\[[^]]+\]|[^\s:]+)(?::(\d+))?", value)
+            if match:
+                address, port = match.group(1).strip("[]"), match.group(2) or "445"
+            access = re.match(r"\s*(\S+)\s+(READ ONLY|READ,? WRITE|READ/WRITE|READABLE)\b", value, re.I)
+            if access and address and in_scope(data, address) and not administrative_share(access.group(1)):
+                share = access.group(1)
+                host = f"[{address}]" if ":" in address else address
+                peers = [row for row in data.service_observations if scope_host(row.target) == scope_host(address)]
+                context = {}
+                for key in ("platform", "domain", "hostname"):
+                    values = {getattr(row, key) for row in peers if getattr(row, key) not in {"", "unknown"}}
+                    context[key] = next(iter(values)) if len(values) == 1 else "unknown" if key == "platform" else ""
+                record_service_observation(data, ServiceObservation("smb", "anonymous-share-access",
+                    f"smb://{host}:{port}/{urllib.parse.quote(share, safe='')}", "access-observed", resource=share,
+                    access=access.group(2).upper(), evidence=[source_evidence(data, rel, line)],
+                    detail="Read access observed with the collector's empty-credential SMB probe; guest mapping is possible.", **context))
+
+
+def parse_nse(data: ReconData) -> None:
+    xml_bases = set()
+    for rel, text in data.files.items():
+        if not nmap_artifact(rel) or not rel.endswith(".xml"):
+            continue
+        if "<!ENTITY" in text.upper():
+            data.coverage.append(f"Rejected XML entities in {rel}.")
+            continue
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            data.coverage.append(f"Nmap XML is incomplete or unreadable: {rel}.")
+            continue
+        xml_bases.add(rel[:-4])
+        for host in root.findall("host"):
+            addresses = [v.get("addr", "") for v in host.findall("address") if v.get("addrtype") in ("ipv4", "ipv6")]
+            address = next((v for v in addresses if in_scope(data, v)), "")
+            if not address:
+                continue
+            url_host = f"[{address}]" if ":" in address else address
+            host_text = "\n".join(script.get("output", "") for script in host.findall(".//script"))
+            host_text += "\n" + " ".join(" ".join(service.attrib.values()) for service in host.findall("ports/port/service"))
+            context = observed_context(host_text)
+            invocation = root.get("args", "")
+            smb_ports = []
+            for candidate in host.findall("ports/port"):
+                candidate_service = candidate.find("service")
+                if candidate.get("portid", "").isdigit() and candidate.get("protocol") == "tcp" and candidate.find("state") is not None and candidate.find("state").get("state") == "open":
+                    name = candidate_service.get("name", "") if candidate_service is not None else ""
+                    product = candidate_service.get("product", "") if candidate_service is not None else ""
+                    if service_category(int(candidate.get("portid")), name, product) == "smb":
+                        smb_ports.append(candidate.get("portid"))
+            for port in host.findall("ports/port"):
+                if port.find("state") is None or port.find("state").get("state") != "open":
+                    continue
+                service = port.find("service")
+                target = f"{'tls' if service is not None and service.get('tunnel') == 'ssl' else port.get('protocol', 'tcp')}://{url_host}:{port.get('portid', '')}"
+                if service is not None and port.get("portid", "").isdigit():
+                    service_name = ("ssl/" if service.get("tunnel") == "ssl" else "") + service.get("name", "")
+                    add_port(data, int(port.get("portid")), service_name, " ".join(value for value in (service.get("product", ""), service.get("version", "")) if value), port.get("protocol", "tcp"))
+                    observe_nmap_service(data, address, int(port.get("portid")), port.get("protocol", "tcp"), service_name, service.get("product", ""), service.get("version", ""), rel, context)
+                for script in port.findall("script"):
+                    script_id = script.get("id", "unknown")
+                    output = script.get("output", "")
+                    nse_match(data, target, script_id, output, rel, 1, f"host[{address}]/port[{port.get('portid')}]/script[{script_id}]")
+                    observe_nmap_script(data, target, script_id, output, rel, 1, context, invocation, f"host[{address}]/port[{port.get('portid')}]/script[{script_id}]")
+            for script in host.findall("hostscript/script"):
+                script_id = script.get("id", "unknown")
+                target = f"tcp://{url_host}:{smb_ports[0]}" if script_id.startswith("smb") and len(smb_ports) == 1 else address
+                nse_match(data, target, script_id, script.get("output", ""), rel, 1, "hostscript")
+                observe_nmap_script(data, target, script_id, script.get("output", ""), rel, 1, context, invocation, f"host[{address}]/hostscript[{script_id}]")
+    for rel, text in data.files.items():
+        if not nmap_artifact(rel) or not rel.endswith(".txt") or rel[:-4] in xml_bases:
+            continue
+        host, port, script, block, start, smb_ports = "", "", "", [], 1, []
+        def flush():
+            if script and host:
+                script_target = port or host
+                if script.startswith("smb") and not port and len(smb_ports) == 1:
+                    script_target = f"tcp://{'[' + host + ']' if ':' in host else host}:{smb_ports[0]}"
+                nse_match(data, script_target, script, "\n".join(block), rel, start)
+                observe_nmap_script(data, script_target, script, "\n".join(block), rel, start, observed_context(""), text.splitlines()[0] if text.startswith("# Nmap") else "")
+        for line_no, line in enumerate(text.splitlines(), 1):
+            host_match = re.match(r"Nmap scan report for (?:.*\()?([A-Za-z0-9.:_-]+)\)?$", line)
+            port_match = NMAP_OPEN_RE.match(line)
+            script_match = re.match(r"^\|[_ ]([A-Za-z0-9_-]+):(?:\s*(.*))?$", line)
+            if host_match or port_match or script_match:
+                flush()
+                script, block = "", []
+            if host_match:
+                host, port, smb_ports = host_match.group(1), "", []
+            elif port_match:
+                address = f"[{host}]" if ":" in host else host
+                port = f"{'tls' if port_match.group(3).startswith('ssl/') else port_match.group(2)}://{address}:{port_match.group(1)}"
+                if port_match.group(2) == "tcp" and port_match.group(1) in {"139", "445"}:
+                    smb_ports.append(port_match.group(1))
+                banner = port_match.group(4) or ""
+                version = re.search(r"\b\d+(?:\.\d+){1,3}\b", banner)
+                observe_nmap_service(data, host, int(port_match.group(1)), port_match.group(2), port_match.group(3), banner, version.group(0) if version else "", rel, observed_context(banner))
+            elif script_match:
+                script, block, start = script_match.group(1), [script_match.group(2) or ""], line_no
+            elif script and line.startswith("|"):
+                block.append(line[1:].lstrip("_ "))
+            elif script:
+                flush()
+                script, block = "", []
+            if line.strip() == "Host script results:":
+                port = ""
+        flush()
+
+
 def load_recon(root: Path, source: Path) -> ReconData:
     data = ReconData(root=root, source=source)
 
@@ -1845,6 +2443,11 @@ def load_recon(root: Path, source: Path) -> ReconData:
         data.files[rel] = read_text(path)
 
     parse_target_env(data)
+    initialize_scope(data)
+    parse_collection_status(data)
+    for rel, text in data.files.items():
+        if rel.endswith("live-web-urls.txt") and raw_web_evidence(rel):
+            data.web_urls.update(normalize_url(url) for url in URL_RE.findall(text) if in_scope(data, url))
     parse_ports(data)
     infer_tech_from_ports(data)
     parse_web(data)
@@ -1852,23 +2455,9 @@ def load_recon(root: Path, source: Path) -> ReconData:
     parse_smb(data)
     parse_ad_dns_ldap(data)
     parse_interesting(data)
-
-    summary = data.files.get("summary.md", "")
-
-    if not data.ip:
-        match = re.search(r"^- IP:\s*(.+)$", summary, re.MULTILINE)
-        if match:
-            data.ip = match.group(1).strip()
-
-    if not data.host:
-        match = re.search(r"^- Hostname:\s*(.+)$", summary, re.MULTILINE)
-        if match:
-            data.host = match.group(1).strip()
-
-    if not data.box:
-        match = re.search(r"^# Recon Summary -\s*(.+)$", summary, re.MULTILINE)
-        if match:
-            data.box = match.group(1).strip()
+    parse_web_assessment(data)
+    parse_nse(data)
+    parse_smb_access(data)
 
     return data
 
@@ -1882,12 +2471,12 @@ def target_name(data: ReconData) -> str:
 
 
 def preferred_web_base(data: ReconData) -> str:
-    if data.web_urls:
-        urls = sorted(data.web_urls)
-        for url in urls:
-            if ":3000" in url:
-                return url.rstrip("/")
-        return urls[0].rstrip("/")
+    management_ports = service_ports(data, "winrm")
+    urls = [url for url in data.web_urls if in_scope(data, url) and urllib.parse.urlsplit(url).port not in management_ports]
+    if urls:
+        urls.sort(key=lambda url: (scope_host(url) != scope_host(data.host or data.ip), urllib.parse.urlsplit(url).scheme != "https", len(url), url))
+        parsed = urllib.parse.urlsplit(urls[0])
+        return f"{parsed.scheme}://{parsed.netloc}"
 
     tcp_ports = {p.number: p for p in data.ports.values() if p.proto == "tcp"}
     ports = set(tcp_ports)
@@ -1901,9 +2490,11 @@ def preferred_web_base(data: ReconData) -> str:
         return f"http://{host}:3000"
 
     for port in sorted(ports):
+        if port in management_ports:
+            continue
         service = tcp_ports[port].service.lower()
         if "http" in service or port in {5000, 8000, 8080, 8443, 9000, 9090, 10000}:
-            scheme = "https" if port == 8443 else "http"
+            scheme = "https" if port == 8443 or service.startswith("ssl/") else "http"
             return f"{scheme}://{host}:{port}"
 
     return f"http://{host}"
@@ -1912,27 +2503,33 @@ def preferred_web_base(data: ReconData) -> str:
 def detect_profile(data: ReconData) -> list[str]:
     profiles = []
     ports = {p.number for p in data.ports.values() if p.proto == "tcp"}
-    tech = " ".join(sorted(data.technologies)).lower()
+    tech = " ".join(sorted(data.technologies) + [row.product for row in data.service_observations]).lower()
 
-    if {88, 389, 445}.issubset(ports) or "active directory" in tech:
-        profiles.append("Windows Active Directory / Domain Controller")
-    elif any("windows" in t.lower() for t in data.technologies) or 445 in ports:
+    platforms = {observation.platform for observation in data.service_observations}
+    banner_text = " ".join(port.version for port in data.ports.values() if port.proto == "tcp").lower()
+    if "samba" in banner_text or "Samba" in platforms:
+        profiles.append("Samba service fingerprint; Windows is not established")
+    elif "Windows" in platforms or "windows" in banner_text or any("windows" in t.lower() for t in data.technologies):
         profiles.append("Windows")
     else:
-        profiles.append("Linux/Unix or unknown")
+        profiles.append("Operating system unconfirmed")
+    if (service_ports(data, "kerberos") and service_ports(data, "ldap") and service_ports(data, "smb")) or "active directory" in tech:
+        profiles.append("Active Directory / directory service candidate")
 
     if any(p in ports for p in (80, 443, 3000, 5000, 8000, 8080, 8443, 9000, 9090, 10000)) or data.web_urls:
         profiles.append("Web application")
-    if 445 in ports:
+    if service_ports(data, "smb"):
         profiles.append("SMB exposed")
-    if 389 in ports or 3268 in ports:
+    if service_ports(data, "ldap"):
         profiles.append("LDAP exposed")
     if 88 in ports:
         profiles.append("Kerberos exposed")
-    if 5985 in ports or 5986 in ports:
+    if service_ports(data, "winrm"):
         profiles.append("WinRM exposed")
-    if 1433 in ports or 6520 in ports or "sql server" in tech:
+    if service_ports(data, "mssql"):
         profiles.append("MSSQL exposed")
+    if service_ports(data, "rdp"):
+        profiles.append("RDP access requires authorized credentials and rights")
     if 9389 in ports or ".net message framing" in tech:
         profiles.append(".NET/ADWS-style service exposed")
     if "zabbix" in tech or 10050 in ports or 10051 in ports:
@@ -1944,7 +2541,7 @@ def detect_profile(data: ReconData) -> list[str]:
 def build_findings(data: ReconData) -> list[Finding]:
     findings: list[Finding] = []
     ports = {p.number for p in data.ports.values() if p.proto == "tcp"}
-    tech = " ".join(sorted(data.technologies)).lower()
+    tech = " ".join(sorted(data.technologies) + [row.product for row in data.service_observations]).lower()
     endpoints_low = {endpoint.lower() for endpoint in data.endpoints}
     shares_low = {share.lower() for share in data.smb_shares}
     base_url = preferred_web_base(data)
@@ -1982,15 +2579,15 @@ def build_findings(data: ReconData) -> list[Finding]:
             if next_chunks:
                 evidence.append("Next static JS chunks: " + ", ".join(next_chunks))
 
-        matched_text = " ".join((m.vuln_id + " " + m.title + " " + m.summary) for m in data.vuln_matches).lower()
-        has_online_rsc_match = bool(data.vuln_matches) and any(
-            token in matched_text for token in ("react server components", "react2shell", "cve-2025-55182", "remote code execution")
-        ) and (data.nextjs_app_router or data.rsc_indicators)
+        relevant = [m for m in data.vuln_matches if m.source == "OSV" and m.ecosystem.lower() == "npm"
+                    and m.package in {"next", "react-server-dom-webpack", "react-server-dom-parcel", "react-server-dom-turbopack"}
+                    and m.target and m.evidence and in_scope(data, m.target)]
+        has_online_rsc_match = any(re.search(r"\b(?:react server components|react2shell|CVE-2025-55182)\b", match_text(m), re.I) for m in relevant)
 
         if has_online_rsc_match:
             detail = (
-                "Next.js App Router/RSC artifacts were detected and online vulnerability intelligence returned relevant RSC/RCE advisory matches. "
-                "Treat this as a high-priority manual validation target."
+                "A response-attributed framework version has a package-specific RSC advisory match. "
+                "Confirm affected deployment features and prerequisites on that same application."
             )
         else:
             detail = (
@@ -2001,7 +2598,7 @@ def build_findings(data: ReconData) -> list[Finding]:
         findings.append(Finding(
             "Next.js / React Server Components attack surface",
             detail,
-            "high" if has_online_rsc_match else "medium",
+            "medium",
             evidence=evidence or ["Next.js-like artifacts detected"],
             commands=[
                 "grep -Rho 'window.next={[^}]*}' enum/web/ 2>/dev/null | sort -u",
@@ -2012,12 +2609,14 @@ def build_findings(data: ReconData) -> list[Finding]:
             ],
         ))
 
-        if any(("29927" in m.vuln_id or "middleware" in (m.title + " " + m.summary).lower() or "subrequest" in (m.title + " " + m.summary).lower()) for m in data.vuln_matches):
+        middleware_matches = [m for m in relevant if m.package == "next" and
+                              "CVE-2025-29927" in [m.vuln_id, *m.aliases] and nextjs_middleware_bypass_vulnerable(m.version)]
+        if middleware_matches:
             findings.append(Finding(
                 "Next.js middleware authorization-bypass candidate",
-                "The detected Next.js version is in a range where middleware-based authorization bypass should be tested if protected routes such as /admin or /dashboard exist.",
+                "A version-specific Next.js advisory match needs validation of middleware-based authorization and affected routes on the attributed endpoint.",
                 "medium",
-                evidence=["Next.js version(s): " + ", ".join(sorted(data.nextjs_versions))],
+                evidence=[f"{m.target}: Next.js {m.version}, {m.vuln_id}" for m in middleware_matches],
                 commands=[
                     f"for p in admin dashboard login internal monitor monitoring api/status api/health; do echo ===== /$p =====; curl -s -i '{base_url}/'$p | head -n 25; done",
                     f"curl -i '{base_url}/admin' -H 'x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware'",
@@ -2027,9 +2626,9 @@ def build_findings(data: ReconData) -> list[Finding]:
     if data.vuln_matches:
         top = data.vuln_matches[:10]
         findings.append(Finding(
-            "Online vulnerability intelligence matches",
-            "OSV/NVD returned vulnerability records for detected packages or technology keywords. Treat exact package-version OSV matches as stronger than NVD keyword matches.",
-            "high",
+            "Vulnerability evidence and advisory candidates",
+            "Scanner hits, package advisories and keyword candidates have different evidence strengths. Review status, source and prerequisites before treating a candidate as exploitable.",
+            "medium",
             evidence=[f"{m.source}: {m.vuln_id} | {m.severity} | {m.package} {m.version} | {m.title}" for m in top],
             commands=[
                 "Review the Vulnerability Intelligence section in this report.",
@@ -2079,81 +2678,77 @@ def build_findings(data: ReconData) -> list[Finding]:
             ],
         ))
 
-    if {53, 88, 389, 445}.issubset(ports) or "active directory" in tech:
+    ldap_ports = service_ports(data, "ldap")
+    if (ldap_ports and service_ports(data, "kerberos") and service_ports(data, "smb")) or "active directory" in tech:
+        ldap_port = min(ldap_ports) if ldap_ports else None
+        ldap_url = f"{'ldaps' if service_uses_tls(data, ldap_port) else 'ldap'}://{target_ip(data)}:{ldap_port}" if ldap_port else "<observed-ldap-endpoint>"
         findings.append(Finding(
-            "Windows AD/DC-style attack surface",
-            "DNS, Kerberos, LDAP, and SMB are exposed. Treat this as an Active Directory target and prioritize domain enumeration.",
-            "high",
+            "Directory services / Active Directory evidence",
+            "Observed directory-service fingerprints suggest a domain environment. Confirm the host role and access policy; service presence does not establish credentials or privileges.",
+            "medium",
             evidence=[
                 f"Ports: {', '.join(str(p) for p in sorted(ports & {53, 88, 389, 445, 464, 636, 3268, 3269}))}",
                 f"Domain: {data.domain or data.host or 'unknown'}",
                 f"Computer: {data.computer or 'unknown'}",
             ],
             commands=[
-                f"netexec smb {target_ip(data)} -u guest -p '' --shares",
-                f"ldapsearch -x -H ldap://{target_ip(data)} -s base namingcontexts",
-                f"nxc ldap {target_ip(data)} -u guest -p '' --users",
+                f"ldapsearch -x -H '{ldap_url}' -s base namingcontexts",
             ],
         ))
 
-    if 445 in ports and data.smb_shares:
+    smb_ports = service_ports(data, "smb")
+    smb_port = 445 if 445 in smb_ports else min(smb_ports) if smb_ports else None
+    if smb_ports and data.smb_shares:
         shares = sorted(data.smb_shares)
         default_shares = {"admin$", "c$", "ipc$", "netlogon", "sysvol"}
         non_default = [s for s in shares if s.lower() not in default_shares]
 
-        commands = [f"smbclient -L //{target_ip(data)} -U '%'"]
+        commands = [f"smbclient -L //{target_ip(data)} -p {smb_port} -U '%'"]
         for share in non_default:
-            commands.append(f"smbclient //{target_ip(data)}/{share} -U '%'")
+            commands.append(f"smbclient '//{target_ip(data)}/{share}' -p {smb_port} -U '%'")
 
         findings.append(Finding(
             "SMB share enumeration produced share names",
             "SMB shares were enumerated. Review non-default shares first.",
-            "high" if non_default else "medium",
+            "medium",
             evidence=[", ".join(shares)],
             commands=commands,
         ))
 
-    if "software$" in shares_low:
+    if smb_ports and "software$" in shares_low:
         findings.append(Finding(
-            "High-value SMB share: software$",
-            "A non-default software$ share exists. Download and inspect binaries, configs, scripts, and connection strings.",
-            "high",
+            "SMB share access review: software$",
+            "A software$ share name was returned. Confirm read permission and intended exposure before inspecting any files.",
+            "medium",
             evidence=["Share: software$"],
             commands=[
-                "mkdir -p loot/software && cd loot/software",
-                f"smbclient //{target_ip(data)}/software$ -U '%' -c 'recurse ON; prompt OFF; mget *'",
-                "find . -type f",
-                "grep -RniE \"password|user|uid|pwd|server|sql|connection|string\" .",
+                f"smbclient '//{target_ip(data)}/software$' -p {smb_port} -U '%' -c 'ls'",
             ],
         ))
 
-    if 1433 in ports or 6520 in ports or "sql server" in tech:
-        port = 6520 if 6520 in ports else 1433
+    mssql_ports = service_ports(data, "mssql")
+    if mssql_ports:
         findings.append(Finding(
-            "MSSQL service exposed",
-            "MSSQL is exposed. Look for credentials in SMB shares, configs, source files, or notes, then test SQL authentication and linked servers.",
-            "high",
-            evidence=[f"Port {port}", *[t for t in sorted(data.technologies) if "SQL Server" in t]],
-            commands=[
-                f"netexec mssql {target_ip(data)} --port {port} -u <user> -p '<password>'",
-                f"impacket-mssqlclient '<domain>/<user>:<password>@{target_name(data)}' -p {port} -windows-auth",
-                "select @@version;",
-                "select suser_name();",
-                "select name from sys.servers;",
-            ],
+            "MSSQL service/access candidate",
+            "The detected SQL endpoint requires an authorized account and database permissions. A banner or listening port does not establish SQL access or vulnerability.",
+            "medium",
+            evidence=[f"Observed SQL port(s): {', '.join(map(str, sorted(mssql_ports)))}", *[t for t in sorted(data.technologies) if "SQL Server" in t]],
+            commands=[f"netexec mssql {target_ip(data)} --port {port} -u '<authorized-user>' -p '<password>'" for port in sorted(mssql_ports)],
         ))
 
-    if 5985 in ports or 5986 in ports:
+    winrm_ports = service_ports(data, "winrm")
+    if winrm_ports:
         findings.append(Finding(
-            "WinRM exposed",
-            "WinRM is available. Any recovered domain credentials should be tested for remote shell access.",
-            "high",
-            evidence=[f"Port {'5985' if 5985 in ports else '5986'}"],
-            commands=[
-                f"netexec winrm {target_ip(data)} -u <user> -p '<password>'",
-                f"evil-winrm -i {target_name(data)} -u <user> -p '<password>'",
-            ],
+            "WinRM access prerequisite",
+            "A WinRM-compatible endpoint needs authorized credentials and remote-management rights. NTLM metadata or an open port does not prove shell access.",
+            "low",
+            evidence=[f"Observed WinRM port(s): {', '.join(map(str, sorted(winrm_ports)))}"],
+            commands=[f"evil-winrm -i {target_name(data)} -P {port}{' -S' if service_uses_tls(data, port) else ''} -u '<authorized-user>' -p '<password>'" for port in sorted(winrm_ports)],
         ))
+    if service_ports(data, "rdp"):
+        findings.append(Finding("RDP access prerequisite", "RDP requires authorized credentials, logon rights and compatible NLA/TLS policy; an open port is not a vulnerability.", "low",
+                                evidence=[f"Observed RDP port(s): {', '.join(map(str, sorted(service_ports(data, 'rdp'))))}"],
+                                commands=["Review the recorded RDP/NLA metadata before attempting an authorized interactive login."]))
 
     if 9389 in ports or ".net message framing" in tech:
         findings.append(Finding(
@@ -2451,6 +3046,14 @@ def render_report(data: ReconData, findings: list[Finding]) -> str:
                     f"{md_escape_table(match.severity)} | {md_escape_table(component)} | {match.relevance} | {md_escape_table((match.title or match.summary)[:140])} |"
                 )
             lines.append("")
+            lines.append("### Evidence lineage and prerequisites")
+            for match in data.vuln_matches[:40]:
+                lines.append(f"- {md_code(match.vuln_id)} — {match.status}; target {md_code(public_target(match.target) or 'unattributed')}.")
+                for evidence in match.evidence[:4]:
+                    lines.append(f"  - Source: {md_code(evidence['path'] + ':' + str(evidence['line']))}; locator {md_code(evidence.get('locator', ''))}; SHA-256 {md_code(evidence['sha256'])}.")
+                if match.prerequisites:
+                    lines.append("  - Prerequisites: " + " ".join(match.prerequisites))
+            lines.append("")
             lines.append("### Vulnerability References")
             for match in data.vuln_matches[:20]:
                 if match.references:
@@ -2464,6 +3067,16 @@ def render_report(data: ReconData, findings: list[Finding]) -> str:
             for err in data.vuln_errors:
                 lines.append(f"- {md_code(err)}")
             lines.append("")
+
+    if data.service_observations:
+        lines.extend(["## Observed service access and metadata", "", "These records distinguish observed access, service fingerprints and conditional configuration leads. They are not automatically vulnerabilities.", "",
+                      "| Service | Endpoint | Observation/status | Platform/domain | Evidence |", "|---|---|---|---|---|"])
+        for observed in data.service_observations[:60]:
+            evidence = observed.evidence[0]
+            fact = " ".join(value for value in (observed.kind, observed.status, observed.resource, observed.access, observed.product, observed.version) if value)
+            context = " / ".join(value for value in (observed.platform, observed.domain, observed.hostname) if value)
+            lines.append("| " + " | ".join(md_escape_table(value) for value in (observed.service, public_target(observed.target), fact, context, f"{evidence['path']}:{evidence['line']}")) + " |")
+        lines.append("")
 
     lines.append("## Prioritized Findings and Next Steps")
     lines.append("")
@@ -2531,6 +3144,130 @@ def default_output_path(input_path: Path, root: Path, is_zip: bool) -> Path:
     return root / "recon-analysis.md"
 
 
+def public_target(target: str) -> str:
+    """Overview URLs retain input names, never credentials or query values."""
+    try:
+        value = urllib.parse.urlsplit(target)
+        if not value.scheme or not value.hostname:
+            return target[:180]
+        host = f"[{value.hostname}]" if ":" in value.hostname else value.hostname
+        if value.port:
+            host += f":{value.port}"
+        names = list(dict.fromkeys(name for name, _ in urllib.parse.parse_qsl(value.query, keep_blank_values=True)))
+        query = "&".join(urllib.parse.quote(name[:80], safe="") for name in names[:20])
+        return urllib.parse.urlunsplit((value.scheme, host, value.path, query, ""))
+    except ValueError:
+        return "<invalid target>"
+
+
+def route_eligible(data: ReconData, match: VulnMatch) -> bool:
+    if not match.evidence or not match.target or not in_scope(data, match.target):
+        return False
+    if match.status == "scanner-match":
+        return severity_rank(match.severity) < 4 or (match.source == "NMAP-NSE" and match.severity == "unknown")
+    if match.source == "SERVICE-EVIDENCE":
+        return match.status in {"access-observed", "conditional-lead"}
+    if match.source == "OSV":
+        key = f"{match.ecosystem}:{match.package}"
+        return any(row["kind"] == "observed" and row["version"] == match.version and row["target"] == match.target for row in data.package_evidence.get(key, []))
+    return match.source == "LOCAL-RULE" and match.confidence == "high" and bool(match.version and match.version != "version unknown")
+
+
+def service_access_leads(data: ReconData) -> list[VulnMatch]:
+    leads = []
+    for observed in data.service_observations:
+        title, prerequisite, next_test, status = "", "", "", "access-observed"
+        if observed.kind == "anonymous-share-access" and observed.status == "access-observed":
+            title = "Anonymous/guest-readable SMB shares"
+            prerequisite = "Access was observed with empty credentials; verify whether the exposed content is intended to be public."
+            next_test = f"List share {observed.resource} with the same empty-credential session; inspect a small allowed sample for exposed configuration."
+        elif observed.kind == "anonymous-objects" and observed.status == "access-observed":
+            title = "Anonymous LDAP object access"
+            prerequisite = "Anonymous object attributes were returned; determine whether this directory exposure is intended."
+            context = f" for {observed.domain}" if observed.domain else ""
+            next_test = f"Repeat a bounded anonymous query{context}; review returned object types and intended access policy."
+        elif observed.kind == "signing-not-required":
+            title, status = "SMB signing is not required: conditional relay lead", "conditional-lead"
+            prerequisite = "Needs controlled authentication (credentials/authorized coercion), a reachable compatible relay path and target rights. None are established."
+            next_test = "Verify signing policy and relay prerequisites on this host; do not infer a working relay path from negotiation alone."
+        if not title:
+            continue
+        leads.append(score_vuln_match(data, VulnMatch("SERVICE-EVIDENCE", observed.kind, title=title,
+            severity="low" if status == "conditional-lead" else "medium", confidence="low" if status == "conditional-lead" else "medium",
+            target=observed.target, evidence=observed.evidence, status=status,
+            prerequisites=[prerequisite], next_test=next_test,
+            context={"platform": observed.platform, "domain": observed.domain, "hostname": observed.hostname,
+                     "service": observed.service, "access": observed.access, "resource": observed.resource})))
+    return leads
+
+
+def build_overview(data: ReconData) -> dict:
+    routes, grouped = [], {}
+    candidates = top_vuln_candidates(data, limit=len(data.vuln_matches)) + service_access_leads(data)
+    for match in sorted(candidates, key=lambda match: (-match.relevance, severity_rank(match.severity), match.vuln_id)):
+        if not route_eligible(data, match):
+            continue
+        advisory_ids = sorted(set(value for value in [match.vuln_id, *match.aliases] if re.fullmatch(r"(?:CVE-\d{4}-\d+|GHSA-[a-z0-9-]+)", value, re.I)))
+        target = public_target(match.target)
+        parsed = urllib.parse.urlsplit(target)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else target
+        key = (origin, tuple(advisory_ids) or match.vuln_id)
+        affected_input = {"target": target, "method": match.request_method or None,
+                          "parameter": match.parameter or None, "position": match.parameter_position or None,
+                          "session_present": match.session_present, "evidence": match.evidence}
+        if match.context:
+            affected_input["context"] = match.context
+        if key in grouped:
+            route = grouped[key]
+            if affected_input not in route["inputs"]:
+                route["inputs"].append(affected_input)
+            route["evidence"].extend(row for row in match.evidence if row not in route["evidence"])
+            continue
+        if len(routes) == 3:
+            continue
+        route_id = hashlib.sha256(repr(key).encode()).hexdigest()[:12]
+        route = {
+            "id": route_id, "title": first_text(match.title or match.vuln_id, 110),
+            "target": target, "severity": match.severity,
+            "confidence": match.confidence, "status": match.status, "source": match.source,
+            "template_id": match.vuln_id if match.source == "NUCLEI" else None,
+            "advisory_ids": advisory_ids, "evidence": list(match.evidence), "inputs": [affected_input],
+            "prerequisites": match.prerequisites or ["Confirm deployment and affected feature; prerequisites are not yet established."],
+            "next_test": match.next_test,
+        }
+        if match.context:
+            route["context"] = match.context
+        routes.append(route)
+        grouped[key] = route
+    coverage = list(dict.fromkeys(data.coverage + data.vuln_errors))
+    return {"schema_version": 1, "status": "partial" if coverage else "complete",
+            "targets": sorted({public_target(v) for v in data.web_urls if in_scope(data, v)} | {v for v in (data.ip, data.host) if v}),
+            "assessment_run": data.latest_assessment or None, "coverage": coverage,
+            "limitations": list(dict.fromkeys(["Scanner hits require manual confirmation. Authentication, authorization and business logic require separate review."] + data.assessment_limits)),
+            "routes": routes}
+
+
+def render_overview(overview: dict) -> str:
+    lines = ["# Recon overview", "", f"Coverage: **{overview['status']}**. Ranked by observed evidence before advisory severity.", ""]
+    if not overview["routes"]:
+        lines += ["No actionable attack route is established by the current evidence. This does not mean the target is secure.", ""]
+    for index, route in enumerate(overview["routes"], 1):
+        evidence = route["evidence"][0]
+        path = evidence["path"].replace("\\", "/")
+        label = f"{Path(path).name}:{evidence['line']}"
+        title = route["title"].replace("\n", " ")
+        others = f" +{len(route['inputs']) - 1} other inputs" if len(route["inputs"]) > 1 else ""
+        lines += [f"{index}. **{title}** — `{route['target']}`{others} ({route['status']}, {route['confidence']} confidence).",
+                  f"   Evidence: [{label}](<{urllib.parse.quote(path, safe='/._-')}>). " + (", ".join(route["advisory_ids"]) + "." if route["advisory_ids"] else ""),
+                  "   Prerequisite: " + first_text(" ".join(route["prerequisites"]), 160),
+                  "   Next test: " + first_text(route["next_test"], 170), ""]
+    notes = overview["coverage"][:3]
+    if notes:
+        lines += ["Coverage gaps: " + " ".join(first_text(note, 120) for note in notes), ""]
+    lines += [overview["limitations"][0], "", "Full evidence and remaining coverage notes: `overview.json` and `recon-analysis.md`.", ""]
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Analyze htb-init recon folder or ZIP and generate recon-analysis.md"
@@ -2570,6 +3307,9 @@ def main() -> int:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(report, encoding="utf-8")
+        overview = build_overview(data)
+        (out_path.parent / "overview.json").write_text(json.dumps(overview, indent=2) + "\n", encoding="utf-8")
+        (out_path.parent / "overview.md").write_text(render_overview(overview), encoding="utf-8")
 
         print(f"[+] Recon root: {root}")
         print(f"[+] Parsed files: {len(data.files)}")
@@ -2578,6 +3318,7 @@ def main() -> int:
         print(f"[+] Packages/components detected: {len(data.package_versions)}")
         print(f"[+] Vulnerability matches: {len(data.vuln_matches)}")
         print(f"[+] Wrote analysis: {out_path}")
+        print(f"[+] Wrote overview: {out_path.parent / 'overview.md'}")
 
         if args.print_report:
             print()
