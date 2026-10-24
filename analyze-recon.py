@@ -307,9 +307,20 @@ class ReconData:
     forms: set[str] = field(default_factory=set)
     inputs: set[str] = field(default_factory=set)
     smb_shares: set[str] = field(default_factory=set)
+    smb_signing_required: bool = False
+    smb_null_auth: Optional[bool] = None
+    smb_access_denied: bool = False
+    domain_sid: str = ""
     domain: str = ""
     computer: str = ""
+    realm: str = ""
+    dc_hostname: str = ""
+    clock_skew: str = ""
+    ntp_offset: str = ""
     naming_contexts: set[str] = field(default_factory=set)
+    mqtt_anonymous_read: bool = False
+    mqtt_topics: set[str] = field(default_factory=set)
+    mqtt_clients: set[str] = field(default_factory=set)
     interesting_lines: list[str] = field(default_factory=list)
     package_versions: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     vuln_matches: list[VulnMatch] = field(default_factory=list)
@@ -517,6 +528,10 @@ def iter_text_files(root: Path) -> Iterable[Path]:
         rel_parts = set(rel.parts)
 
         if rel_parts & skip_dirs:
+            continue
+        if ".recon-history" in rel.parts:
+            continue
+        if path.name in {"http.templates.txt", "targets.txt", "recon-console.log"}:
             continue
         if path.suffix.lower() in blocked_suffixes:
             continue
@@ -798,6 +813,16 @@ def is_scanner_reference_url(url: str) -> bool:
 
 def normalize_url(url: str) -> str:
     return html.unescape(url).rstrip(".,);:]}>'\"")
+
+
+def is_web_inventory_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host or "_" in host:
+        return False
+    return not host.startswith(("domaindnszones.", "forestdnszones.", "hostmaster.", "fuzz."))
 
 
 def is_interesting_path(path: str) -> bool:
@@ -1169,9 +1194,8 @@ def parse_web(data: ReconData) -> None:
             text = "\n".join(line for line in text.splitlines() if NMAP_OPEN_RE.match(line) or line.startswith("Service Info:"))
         collect_urls = (
             rel.endswith("live-web-urls.txt")
-            or "whatweb" in rel.lower()
-            or rel == "summary.md"
-            or rel.endswith((".html", ".htm"))
+            or rel.endswith("discovered-host-web-urls.txt")
+            or rel.endswith("httpx-web-services.txt")
         )
 
         if collect_urls:
@@ -1182,6 +1206,8 @@ def parse_web(data: ReconData) -> None:
                 if is_scanner_reference_url(url):
                     continue
                 if re.match(r"^https?://[a-z](?:[#/:?@]|$)", low_url):
+                    continue
+                if not is_web_inventory_url(url):
                     continue
 
                 if in_scope(data, url):
@@ -1260,6 +1286,21 @@ def parse_smb(data: ReconData) -> None:
         if match:
             data.domain = data.domain or match.group(1).lower()
 
+        match = re.search(r"Domain Sid:\s*(S-[0-9-]+)", text, re.IGNORECASE)
+        if match:
+            data.domain_sid = data.domain_sid or match.group(1)
+
+        null_auth = re.search(r"Null Auth:(True|False)", text, re.IGNORECASE)
+        if null_auth:
+            data.smb_null_auth = null_auth.group(1).lower() == "true"
+        elif "allows sessions using username '', password ''" in text:
+            data.smb_null_auth = True
+
+        if re.search(r"Message signing enabled and required|signing:True", text, re.IGNORECASE):
+            data.smb_signing_required = True
+        if re.search(r"access denied|NT_STATUS_ACCESS_DENIED", text, re.IGNORECASE):
+            data.smb_access_denied = True
+
 
 def parse_ad_dns_ldap(data: ReconData) -> None:
     for rel, text in data.files.items():
@@ -1290,6 +1331,63 @@ def parse_ad_dns_ldap(data: ReconData) -> None:
             data.computer = data.computer or match.group(2).replace("$", "").strip()
 
 
+def parse_target_profile(data: ReconData) -> None:
+    profile = data.files.get("scans/target-profile.txt", "")
+    for key, value in re.findall(r"^([a-z_]+)=(.*)$", profile, re.MULTILINE):
+        value = value.strip()
+        if key == "domain" and value:
+            data.domain = data.domain or value
+        elif key == "realm" and value:
+            data.realm = value
+        elif key == "dc_hostname" and value:
+            data.dc_hostname = value
+            data.computer = data.computer or value.split(".", 1)[0].upper()
+        elif key == "clock_skew" and value:
+            data.clock_skew = value
+
+    if not data.clock_skew:
+        data.clock_skew = data.files.get("enum/ad/clock-skew.txt", "").strip().splitlines()[0] \
+            if data.files.get("enum/ad/clock-skew.txt", "").strip() else ""
+
+    ntp = data.files.get("enum/ad/ntp-query.txt", "")
+    match = re.search(r"([+-]\d+(?:\.\d+)?)\s+\+/-", ntp)
+    if match:
+        data.ntp_offset = match.group(1) + " seconds"
+
+
+def parse_mqtt(data: ReconData) -> None:
+    candidates = [
+        "scans/tcp-services.txt",
+        "scans/tcp-aggressive.txt",
+        "scans/tcp-default-safe-scripts.txt",
+        "enum/mqtt/sys-topics.txt",
+        "enum/mqtt/all-topics.txt",
+    ]
+    for rel in candidates:
+        text = data.files.get(rel, "")
+        if not text:
+            continue
+        for topic in re.findall(r"(?m)(\$SYS/[A-Za-z0-9_./+-]+)", text):
+            data.mqtt_topics.add(topic.rstrip(":"))
+        for client in re.findall(r'"client_id"\s*:\s*"([^"]+)"', text):
+            data.mqtt_clients.add(client)
+        if data.mqtt_topics and (
+            '"username":"(null)"' in text.replace(" ", "")
+            or "mqtt-subscribe:" in text
+            or rel.startswith("enum/mqtt/")
+        ):
+            data.mqtt_anonymous_read = True
+    if data.mqtt_anonymous_read:
+        evidence_rel = next((rel for rel in candidates if "$SYS/" in data.files.get(rel, "")), "")
+        if evidence_rel:
+            record_service_observation(data, ServiceObservation(
+                "mqtt", "anonymous-topic-read", f"mqtt://{target_ip(data)}:1883",
+                "access-observed", resource=", ".join(sorted(data.mqtt_topics)[:5]),
+                access="read", evidence=[source_evidence(data, evidence_rel, needle="$SYS/")],
+                detail="The broker returned system-topic messages without credentials.",
+            ))
+
+
 def parse_interesting(data: ReconData) -> None:
     lines = []
     seen = set()
@@ -1311,6 +1409,9 @@ def parse_interesting(data: ReconData) -> None:
         for line in candidates:
             line = line.strip()
             if not line or "enum/interesting-grep.txt:enum/interesting-grep.txt" in line:
+                continue
+            low_line = line.lower()
+            if "http.templates.txt" in low_line or "/assessments/" in low_line:
                 continue
             if len(line) > 300:
                 line = line[:300] + "..."
@@ -2454,6 +2555,8 @@ def load_recon(root: Path, source: Path) -> ReconData:
     normalize_web_ports(data)
     parse_smb(data)
     parse_ad_dns_ldap(data)
+    parse_target_profile(data)
+    parse_mqtt(data)
     parse_interesting(data)
     parse_web_assessment(data)
     parse_nse(data)
@@ -2526,6 +2629,8 @@ def detect_profile(data: ReconData) -> list[str]:
         profiles.append("Kerberos exposed")
     if service_ports(data, "winrm"):
         profiles.append("WinRM exposed")
+    if 1883 in ports:
+        profiles.append("MQTT exposed")
     if service_ports(data, "mssql"):
         profiles.append("MSSQL exposed")
     if service_ports(data, "rdp"):
@@ -2560,6 +2665,59 @@ def build_findings(data: ReconData) -> list[Finding]:
                 f"ping -c 3 {target_ip(data)}",
                 f"sudo nmap -p- -sS -Pn --reason --max-retries 3 --min-rate 1000 {target_ip(data)} -oN scans/tcp-full-retry.txt",
                 f"sudo nmap -Pn --reason -p 21,22,25,53,80,88,111,135,139,389,443,445,464,593,636,3000,5000,8080,8443,5985,5986 {target_ip(data)} -oN scans/tcp-common-retry.txt",
+            ],
+        ))
+
+    if 1883 in ports and data.mqtt_anonymous_read:
+        findings.append(Finding(
+            "Anonymous MQTT read access confirmed",
+            "The broker returned topic data without a username. Enumerate read-only system topics first, then use a short bounded subscription to application topics. Do not publish automatically.",
+            "high",
+            evidence=[
+                "1883/tcp open mqtt",
+                f"Observed topics: {', '.join(sorted(data.mqtt_topics)[:8])}",
+                f"Observed clients: {', '.join(sorted(data.mqtt_clients)[:8]) or 'none parsed'}",
+            ],
+            commands=[
+                f"timeout 30 mosquitto_sub -h {target_ip(data)} -p 1883 -t '$SYS/#' -v",
+                f"timeout 30 mosquitto_sub -h {target_ip(data)} -p 1883 -t '#' -v",
+            ],
+        ))
+
+    if data.clock_skew:
+        findings.append(Finding(
+            "Kerberos clock skew requires attention",
+            "The domain controller and local system clocks differ materially. Kerberos operations may fail until time is handled deliberately. The collector records this condition but never changes local time.",
+            "high",
+            evidence=[
+                f"Nmap clock skew: {data.clock_skew}",
+                f"NTP offset: {data.ntp_offset or 'see enum/ad/ntp-query.txt'}",
+            ],
+            commands=[
+                "cat enum/ad/clock-skew.txt enum/ad/ntp-query.txt",
+                "# Review the offset before using a scoped time wrapper or deliberately synchronizing the lab VM.",
+            ],
+        ))
+
+    if 445 in ports and data.smb_null_auth is True:
+        detail = (
+            "SMB accepts a null session, but collected evidence also shows access restrictions. "
+            "Treat this as limited anonymous protocol access, not proof of readable shares or user enumeration."
+        )
+        findings.append(Finding(
+            "Restricted SMB null session",
+            detail,
+            "high",
+            evidence=[
+                "Null Auth: True",
+                f"Domain SID: {data.domain_sid or 'not parsed'}",
+                f"Signing required: {'yes' if data.smb_signing_required else 'not confirmed'}",
+                f"Access denied evidence: {'yes' if data.smb_access_denied else 'no'}",
+                f"Enumerated shares: {', '.join(sorted(data.smb_shares)) or 'none'}",
+            ],
+            commands=[
+                "cat enum/smb/netexec-smb.txt enum/smb/smbclient-null-*.txt enum/smb/nmap-smb-*.txt",
+                "# Only attempt bounded SID/RID lookups after confirming that the null session permits them.",
             ],
         ))
 
@@ -2836,10 +2994,16 @@ def build_findings(data: ReconData) -> list[Finding]:
             commands=[
                 f"dig @{target_ip(data)} {domain} ANY",
                 f"dig axfr @{target_ip(data)} {domain}",
-                f"dnsrecon -d {domain} -n {target_ip(data)} -a",
+                f"dnsrecon -d {domain} -n {target_ip(data)} -t srv",
             ],
         ))
 
+    priority_order = {
+        "Anonymous MQTT read access confirmed": 0,
+        "Kerberos clock skew requires attention": 1,
+        "Restricted SMB null session": 2,
+    }
+    findings.sort(key=lambda finding: priority_order.get(finding.title, 3))
     return findings
 
 
@@ -2914,6 +3078,12 @@ def render_report(data: ReconData, findings: list[Finding]) -> str:
         lines.append(f"- Domain: {md_code(data.domain)}")
     if data.computer:
         lines.append(f"- Computer: {md_code(data.computer)}")
+    if data.realm:
+        lines.append(f"- Realm: {md_code(data.realm)}")
+    if data.dc_hostname:
+        lines.append(f"- Domain controller: {md_code(data.dc_hostname)}")
+    if data.clock_skew:
+        lines.append(f"- Clock skew: {md_code(data.clock_skew)}")
     lines.append("")
 
     lines.append("## Detected Profile")
@@ -2994,9 +3164,20 @@ def render_report(data: ReconData, findings: list[Finding]) -> str:
                     lines.append(f"- {md_code(input_name)}")
             lines.append("")
 
-    if data.smb_shares or data.naming_contexts:
+    if (data.smb_shares or data.naming_contexts or data.smb_null_auth is not None
+            or data.smb_signing_required or data.domain_sid):
         lines.append("## AD / SMB / LDAP Intelligence")
         lines.append("")
+        if data.smb_null_auth is not None:
+            lines.append(f"- SMB null authentication accepted: {md_code('yes' if data.smb_null_auth else 'no')}")
+        if data.smb_signing_required:
+            lines.append("- SMB signing: `required`")
+        if data.smb_access_denied:
+            lines.append("- Anonymous SMB enumeration: `restricted/access denied`")
+        if data.domain_sid:
+            lines.append(f"- Domain SID: {md_code(data.domain_sid)}")
+        if data.smb_null_auth is not None or data.smb_signing_required or data.domain_sid:
+            lines.append("")
         if data.smb_shares:
             lines.append("### SMB Shares")
             default_shares = {"admin$", "c$", "ipc$", "netlogon", "sysvol"}
@@ -3009,6 +3190,18 @@ def render_report(data: ReconData, findings: list[Finding]) -> str:
             for nc in sorted(data.naming_contexts):
                 lines.append(f"- {md_code(nc)}")
             lines.append("")
+
+    if data.mqtt_topics or data.mqtt_clients or data.mqtt_anonymous_read:
+        lines.append("## MQTT Intelligence")
+        lines.append("")
+        lines.append(f"- Anonymous read access: {md_code('confirmed' if data.mqtt_anonymous_read else 'not confirmed')}")
+        if data.mqtt_clients:
+            lines.append("- Client IDs: " + ", ".join(md_code(v) for v in sorted(data.mqtt_clients)[:20]))
+        if data.mqtt_topics:
+            lines.append("- Topics:")
+            for topic in sorted(data.mqtt_topics)[:30]:
+                lines.append(f"  - {md_code(topic)}")
+        lines.append("")
 
     if data.package_versions:
         lines.append("## Detected Packages / Components")
@@ -3186,6 +3379,10 @@ def service_access_leads(data: ReconData) -> list[VulnMatch]:
             prerequisite = "Anonymous object attributes were returned; determine whether this directory exposure is intended."
             context = f" for {observed.domain}" if observed.domain else ""
             next_test = f"Repeat a bounded anonymous query{context}; review returned object types and intended access policy."
+        elif observed.kind == "anonymous-topic-read" and observed.status == "access-observed":
+            title = "Anonymous MQTT topic read access"
+            prerequisite = "System-topic messages were returned without credentials; application-topic access is not yet established."
+            next_test = "Run a short read-only subscription to application topics while exercising the web UI; do not publish automatically."
         elif observed.kind == "signing-not-required":
             title, status = "SMB signing is not required: conditional relay lead", "conditional-lead"
             prerequisite = "Needs controlled authentication (credentials/authorized coercion), a reachable compatible relay path and target rights. None are established."

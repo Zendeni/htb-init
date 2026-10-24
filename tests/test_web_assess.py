@@ -131,6 +131,47 @@ class WebAssessmentCLITests(unittest.TestCase):
         )
         self.assertIn("outside.test", json.dumps(report) + result.stderr + result.stdout)
 
+    def test_discovered_winrm_urls_are_skipped(self):
+        scans = self.workspace / "scans"
+        scans.mkdir()
+        (scans / "tcp-services.txt").write_text(
+            "5985/tcp open http Microsoft HTTPAPI httpd 2.0\n"
+            "5986/tcp open ssl/wsman Microsoft HTTPAPI httpd 2.0\n",
+            encoding="utf-8",
+        )
+        (self.web / "live-web-urls.txt").write_text(
+            "http://192.0.2.10:5985/\nhttps://example.test:5986/\nhttp://192.0.2.10:8080/\n",
+            encoding="utf-8",
+        )
+        result = self.call()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.latest_report()
+        self.assertEqual(report["targets"], ["http://192.0.2.10:8080/"])
+        self.assertIn("WinRM", " ".join(report["diagnostics"]))
+
+    def test_explicit_winrm_url_is_allowed(self):
+        result = self.call("--url", "http://192.0.2.10:5985/")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.latest_report()
+        self.assertEqual(report["targets"], ["http://192.0.2.10:5985/"])
+
+    def test_discovered_real_web_app_on_winrm_port_is_allowed(self):
+        scans = self.workspace / "scans"
+        scans.mkdir()
+        (scans / "tcp-services.txt").write_text(
+            "5985/tcp open http nginx 1.27.4\n",
+            encoding="utf-8",
+        )
+        (self.web / "live-web-urls.txt").write_text(
+            "http://192.0.2.10:5985/\n",
+            encoding="utf-8",
+        )
+        result = self.call()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.latest_report()["targets"], ["http://192.0.2.10:5985/"]
+        )
+
     def test_urls_file_works_outside_workspace(self):
         urls = Path(self.temp.name) / "manual target urls.txt"
         urls.write_text("https://example.test/one?a=1&b=2\n", encoding="utf-8")

@@ -159,6 +159,78 @@ class LegacyAnalyzerTests(unittest.TestCase):
             self.assertIn("DNS TCP", report)
             self.assertIn("DNS UDP", report)
 
+    def test_scanner_inventory_and_probe_names_are_not_target_evidence(self):
+        data = self.data({
+            "enum/web/live-web-urls.txt": "http://192.0.2.10:80\n",
+            "enum/web/curl-web-probe.txt": "http://192.0.2.10:1883 000\n",
+            "summary.md": "http://192.0.2.10:5985\nZabbix JWT JWKS Grafana Jenkins\n",
+            "enum/web/jwks.json-http___192_0_2_10_80.txt": "HTTP/1.1 404\n",
+            "enum/web/assessments/run/http.templates.txt": (
+                "http/default-logins/zabbix/zabbix-default-login.yaml\n"
+                "http/exposures/tokens/generic/jwt-token.yaml\n"
+            ),
+            "enum/web/assessments/run/report.json": json.dumps({
+                "status": "incomplete", "findings": [], "diagnostics": ["timed out"],
+            }),
+        })
+        data.ip = "192.0.2.10"
+        data.scope_include = [data.ip]
+        analyzer.parse_web(data)
+        analyzer.parse_web_assessment(data)
+        self.assertEqual(data.web_urls, {"http://192.0.2.10:80"})
+        self.assertFalse({"Zabbix", "JWT", "JWKS", "Grafana", "Jenkins"} & data.technologies)
+        self.assertEqual(data.assessment_status, "incomplete")
+        self.assertFalse(data.scanner_matches)
+
+    def test_mqtt_smb_and_ad_profile_become_prioritized_evidence(self):
+        mqtt = (
+            "1883/tcp open mqtt\n| mqtt-subscribe:\n"
+            '| $SYS/brokers/client_status/mqttui-test: {"username":"(null)",'
+            '"client_id":"mqttui-test","IPv4":"127.0.0.1"}\n'
+        )
+        data = self.data({
+            "scans/tcp-services.txt": mqtt + "445/tcp open microsoft-ds\n",
+            "scans/target-profile.txt": (
+                "profile=windows-ad-dc\ndomain=example.htb\nrealm=EXAMPLE.HTB\n"
+                "dc_hostname=dc01.example.htb\nclock_skew=7h58m30s\n"
+            ),
+            "enum/ad/ntp-query.txt": "now +28711.39 +/- 0.05 192.0.2.10\n",
+            "enum/smb/netexec-smb.txt": (
+                "SMB 192.0.2.10 445 DC01 (name:DC01) (domain:example.htb) "
+                "(signing:True) (Null Auth:True)\n"
+            ),
+            "enum/smb/enum4linux.txt": (
+                "Domain Sid: S-1-5-21-1-2-3\nNT_STATUS_ACCESS_DENIED\n"
+            ),
+        })
+        analyzer.parse_ports(data)
+        analyzer.parse_smb(data)
+        analyzer.parse_target_profile(data)
+        analyzer.parse_mqtt(data)
+        findings = analyzer.build_findings(data)
+        self.assertEqual(findings[0].title, "Anonymous MQTT read access confirmed")
+        self.assertEqual(findings[1].title, "Kerberos clock skew requires attention")
+        self.assertEqual(findings[2].title, "Restricted SMB null session")
+        self.assertTrue(data.smb_signing_required)
+        self.assertEqual(data.domain_sid, "S-1-5-21-1-2-3")
+        report = analyzer.render_report(data, findings)
+        self.assertIn("MQTT Intelligence", report)
+        self.assertIn("SMB signing: `required`", report)
+        self.assertIn("EXAMPLE.HTB", report)
+
+    def test_history_and_template_inventory_are_not_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scans").mkdir()
+            (root / "enum" / "web" / "assessments" / "run").mkdir(parents=True)
+            (root / ".recon-history" / "old" / "enum").mkdir(parents=True)
+            (root / "scans" / "tcp-services.txt").write_text("80/tcp open http IIS\n")
+            (root / "enum" / "web" / "assessments" / "run" / "http.templates.txt").write_text("Zabbix\n")
+            (root / ".recon-history" / "old" / "enum" / "stale.txt").write_text("JWT\n")
+            data = analyzer.load_recon(root, root)
+            self.assertNotIn("enum/web/assessments/run/http.templates.txt", data.files)
+            self.assertFalse(any(path.startswith(".recon-history/") for path in data.files))
+
 
 if __name__ == "__main__":
     unittest.main()

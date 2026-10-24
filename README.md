@@ -92,40 +92,83 @@ command:
 ./recon.sh
 ```
 
-Its vulnerability stage enables Nmap service detection before the `vuln`
-script category, allowing version-dependent scripts such as Vulners to query
-current online intelligence. After collection, the bundled analyzer writes
-**`overview.md`**: up to three evidence-backed attack paths, the next test for
-each, and any important coverage gaps. Start there. `overview.json` contains
-the same structured decisions; `recon-analysis.md` retains the supporting
-detail. Online OSV/NVD enrichment adds version-based research candidates.
-Nuclei and Nikto continue to provide template-based web
-checks. Every external network scanner has a time ceiling. A
+After collection, the bundled analyzer always writes **`overview.md`** with up
+to three evidence-backed attack paths, the next test for each, and important
+coverage gaps. Start there. `overview.json` contains the same structured
+decisions; `recon-analysis.md` retains the supporting detail. Online OSV/NVD
+enrichment adds version-based research candidates. Broad Nuclei, Nikto, legacy
+enum4linux, and the Nmap `vuln` category are deep-mode checks rather than
+standard-mode defaults. Every external network scanner has a time ceiling. A
 timed-out command receives `TERM`, then `KILL` after ten seconds, and the next
 stage continues. Stage updates include percentage and elapsed time.
+
+Standard mode keeps the high-signal discovery and protocol enumeration:
+
+```bash
+./recon.sh
+```
+
+Deep mode restores the broad checks for a deliberately thorough run:
+
+```bash
+RECON_DEEP=1 ./recon.sh
+```
+
+The individual switches remain available: `WEB_ASSESS`, `NUCLEI_ENABLE`,
+`NIKTO_ENABLE`, `VULN_SCAN`, and `MQTT_ALL_TOPICS`.
 
 The main safety limits (in seconds) are `NMAP_MAXTIME=900`,
 `SERVICE_ENUM_MAXTIME=300`, `WEB_PROBE_MAXTIME=120`, `FEROX_MAXTIME=240`,
 `FFUF_MAXTIME=180`, `NIKTO_MAXTIME=600`, `NUCLEI_MAXTIME=600`,
-`WEB_ASSESS_MAXTIME=2100`, `ANALYZER_MAXTIME=900`, and
+`MQTT_ENUM_MAXTIME=30`, `WEB_ASSESS_MAXTIME=2100`, `ANALYZER_MAXTIME=900`, and
 `ARCHIVE_MAXTIME=300`. Override any of them for one run, for example:
 
 ```bash
 NMAP_MAXTIME=600 NIKTO_MAXTIME=300 NUCLEI_MAXTIME=300 ./recon.sh
 ```
 
-When a web application is found, the scope-aware web assessment described
-below runs automatically after hostname discovery. Its crawler and two Nuclei
-stages are internally bounded, and the collector also applies an outer hard
-deadline. Disable it independently when only basic reconnaissance is wanted:
+The scope-aware broad web assessment described below is opt-in and enabled by
+`RECON_DEEP=1`. When explicitly enabled on an Active Directory controller, it
+is deferred until SMB, MSRPC, LDAP, Kerberos, and WinRM enumeration has run.
+Its crawler and Nuclei stages are internally bounded, with an outer hard
+deadline:
 
 ```bash
+WEB_ASSESS=1 ./recon.sh
 WEB_ASSESS_MAXTIME=2100 ./recon.sh
 WEB_ASSESS=0 ./recon.sh
 ```
 
-At startup, the collector refreshes Nuclei templates and rebuilds Nmap's local
-NSE script index. Nikto performs its own built-in update check when scanning.
+Windows and Active Directory detection is additive; generic and Linux targets
+retain the normal stage order. A detected AD target writes normalized facts to
+`scans/target-profile.txt` and `enum/windows/profile.txt`, records clock-skew
+and NTP query evidence without changing local time, queries LDAP rootDSE, and
+adds target-bound MSRPC checks. Kerberos username enumeration is intrusive and
+disabled unless both a realm and user list are supplied explicitly:
+
+```bash
+KERBEROS_REALM=EXAMPLE.HTB KERBEROS_USERDB=/path/to/users.txt ./recon.sh
+```
+
+NSE category scans exclude broadcast scripts, and DNS enumeration remains
+pinned to the configured target resolver. Discovered alternate addresses are
+evidence only; the collector does not scan them automatically.
+
+MQTT on port 1883 receives a bounded, read-only `$SYS/#` subscription when
+`mosquitto_sub` is installed. Subscribing to all application topics remains a
+deep-mode or explicit action; the collector never publishes MQTT messages.
+
+```bash
+MQTT_ALL_TOPICS=1 MQTT_ENUM_MAXTIME=120 ./recon.sh
+```
+
+Each run starts with clean `scans/` and `enum/` evidence. Previous generated
+evidence and logs are moved into `runs/` rather than deleted. The current run
+writes `run-status.json` and `run-stages.tsv`, and the final archive contains
+only current-run evidence.
+
+At startup, the collector refreshes Nuclei templates only when Nuclei or the
+broad web assessment is enabled, and rebuilds Nmap's local NSE script index.
 The preflight is bounded and can be disabled for a repeatable offline run:
 
 ```bash
@@ -250,7 +293,7 @@ New workspaces include `web-assess.sh` and `web-assess.py`. Use the full checkou
 when initializing: the Python helper must sit beside `htb-init.sh` to be copied.
 Existing workspaces can use `python3 /path/to/htb-init/web-assess.py --workspace /path/to/workspace`.
 This is an **active** collection step, separate from offline ScopeLens review.
-Running `recon.sh` starts it after web/vhost discovery; `WEB_ASSESS=0` disables it.
+`recon.sh` starts it only in deep mode or when `WEB_ASSESS=1` is supplied.
 
 Install [ProjectDiscovery Nuclei](https://docs.projectdiscovery.io/opensource/nuclei/install)
 and its signed community templates before running the collector:

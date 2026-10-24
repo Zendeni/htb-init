@@ -52,6 +52,7 @@ LIMITS = [
     "Collector curl --resolve mappings are not inherited by Nuclei. Approved aliases must resolve locally; unresolved origins are blocked and reported as incomplete.",
     "Nuclei templates are trusted scanner code; target filtering and disabled redirects are not a network sandbox.",
 ]
+GENERIC_WEB_EXCLUDED_PORTS = {5985, 5986}  # WinRM is handled by dedicated service enumeration.
 
 
 def canonical_host(value):
@@ -85,6 +86,31 @@ def normalize_url(value):
 def origin(url):
     p = urllib.parse.urlsplit(url)
     return f"{p.scheme}://{p.netloc}"
+
+
+def is_generic_web_candidate(url, workspace):
+    parsed = urllib.parse.urlsplit(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if port not in GENERIC_WEB_EXCLUDED_PORTS:
+        return True
+
+    # Ports 5985/5986 conventionally expose WinRM, but a real web application
+    # can legitimately listen there. Only suppress an automatically discovered
+    # URL when Nmap's service evidence identifies WinRM/Microsoft HTTPAPI.
+    services = workspace / "scans" / "tcp-services.txt"
+    if not services.is_file():
+        return True
+    for line in services.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.match(r"^\s*(\d+)/tcp\s+open\s+(\S+)(?:\s+(.*))?$", line)
+        if not match or int(match.group(1)) != port:
+            continue
+        service = match.group(2).lower()
+        details = (match.group(3) or "").lower()
+        return not (
+            service in {"winrm", "wsman", "ssl/winrm", "ssl/wsman"}
+            or "microsoft httpapi" in details
+        )
+    return True
 
 
 def scope_entry(value):
@@ -805,6 +831,11 @@ def main(argv=None):
                 url = normalize_url(value)
                 if not scope.allows(url):
                     raise ValueError("target outside explicit scope")
+                if not strict and not is_generic_web_candidate(url, args.workspace):
+                    report["diagnostics"].append(
+                        f"Skipped discovered target {value!r}: standard WinRM ports are handled by dedicated service enumeration"
+                    )
+                    continue
                 targets.add(url)
             except ValueError as error:
                 if strict:

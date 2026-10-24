@@ -134,7 +134,7 @@ echo "[+] Target IP: $IP"
 echo "[+] Hostname: $HOST"
 echo "[+] Workspace: $BASE_DIR"
 
-mkdir -p "$BASE_DIR"/{scans,enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,rdp,mssql,ssh,other},loot/{copied,searches},exploits,shells,screenshots,tools}
+mkdir -p "$BASE_DIR"/{scans,enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,rdp,mssql,ssh,windows,ad,mqtt,other},loot/{copied,searches},exploits,shells,screenshots,tools}
 cd "$BASE_DIR"
 BASE_DIR="$PWD"
 
@@ -192,7 +192,11 @@ echo "[+] Updating /etc/hosts for $HOST"
     cat enum/dns/vhost-base-domains.txt 2>/dev/null || true
     cat enum/dns/discovered-hostnames.txt 2>/dev/null || true
     awk '{for (i=2; i<=NF; i++) print $i}' enum/dns/hosts-additions.txt 2>/dev/null || true
-} | sed '/^[[:space:]]*$/d' | tr '[:upper:]' '[:lower:]' | sort -u > "$hostsfile"
+    awk '{for (i=2; i<=NF; i++) print $i}' enum/ad/hosts-additions.txt 2>/dev/null || true
+} | sed '/^[[:space:]]*$/d' \
+    | tr '[:upper:]' '[:lower:]' \
+    | awk '$0 !~ /^(fuzz|hostmaster|domaindnszones|forestdnszones)\./ && $0 !~ /_msdcs/' \
+    | sort -u > "$hostsfile"
 
 echo "[+] Hostnames to map:"
 sed 's/^/    - /' "$hostsfile"
@@ -617,7 +621,7 @@ TOTAL_STAGES=24
 #   ONLINE_VULN_CHECK=0 ./recon.sh
 RECON_DEEP="${RECON_DEEP:-0}"
 WEB_ENUM="${WEB_ENUM:-1}"
-WEB_ASSESS="${WEB_ASSESS:-1}"
+WEB_ASSESS="${WEB_ASSESS:-${NUCLEI_ENABLE:-$RECON_DEEP}}"
 RECON_PYTHON="${HTB_PYTHON:-python3}"
 WEB_SESSION_FILE="${WEB_SESSION_FILE:-}"
 WEB_REQUESTS_FILE="${WEB_REQUESTS_FILE:-}"
@@ -634,7 +638,9 @@ FFUF_MAXTIME="${FFUF_MAXTIME:-180}"
 FEROX_MAXTIME="${FEROX_MAXTIME:-240}"
 FEROX_THREADS="${FEROX_THREADS:-10}"
 NIKTO_MAXTIME="${NIKTO_MAXTIME:-600}"
+NIKTO_ENABLE="${NIKTO_ENABLE:-$RECON_DEEP}"
 NUCLEI_MAXTIME="${NUCLEI_MAXTIME:-600}"
+NUCLEI_ENABLE="${NUCLEI_ENABLE:-$WEB_ASSESS}"
 WEB_ASSESS_MAXTIME="${WEB_ASSESS_MAXTIME:-2100}"
 SCANNER_UPDATE_MAXTIME="${SCANNER_UPDATE_MAXTIME:-180}"
 UPDATE_SCANNER_DATA="${UPDATE_SCANNER_DATA:-1}"
@@ -644,6 +650,9 @@ WEB_PROBE_MAXTIME="${WEB_PROBE_MAXTIME:-120}"
 CURL_MAXTIME="${CURL_MAXTIME:-20}"
 ANALYZER_MAXTIME="${ANALYZER_MAXTIME:-900}"
 ARCHIVE_MAXTIME="${ARCHIVE_MAXTIME:-300}"
+VULN_SCAN="${VULN_SCAN:-$RECON_DEEP}"
+MQTT_ENUM_MAXTIME="${MQTT_ENUM_MAXTIME:-30}"
+MQTT_ALL_TOPICS="${MQTT_ALL_TOPICS:-$RECON_DEEP}"
 MAX_WEB_URLS="${MAX_WEB_URLS:-4}"
 MAX_WEB_WORDLISTS="${MAX_WEB_WORDLISTS:-1}"
 MAX_FFUF_WORDLISTS="${MAX_FFUF_WORDLISTS:-1}"
@@ -652,6 +661,13 @@ ONLINE_VULN_CHECK="${ONLINE_VULN_CHECK:-1}"
 VULN_ANALYZER="${VULN_ANALYZER:-}"
 VULN_TIMEOUT="${VULN_TIMEOUT:-20}"
 MAX_VULN_RESULTS="${MAX_VULN_RESULTS:-8}"
+KERBEROS_USERDB="${KERBEROS_USERDB:-}"
+KERBEROS_REALM="${KERBEROS_REALM:-}"
+TARGET_IS_WINDOWS=0
+TARGET_IS_AD=0
+AD_DOMAIN=""
+AD_DC_HOST=""
+WEB_ASSESS_RAN=0
 # Deduplicate successful scans within this run only. Persisted .done files used
 # to suppress later recon runs, even after a timeout or failed ffuf invocation.
 declare -A VHOST_SCANS_DONE=()
@@ -867,6 +883,45 @@ is_hostname_candidate() {
     return 0
 }
 
+is_web_hostname_candidate() {
+    local name="${1,,}"
+
+    is_hostname_candidate "$name" || return 1
+    [[ "$name" != *_* ]] || return 1
+    case "$name" in
+        domaindnszones.*|forestdnszones.*|*._msdcs.*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+is_web_candidate_port() {
+    local port="$1" service_line service_name
+
+    service_line="$(awk -v wanted="$port/tcp" '$1 == wanted && $2 == "open" {print; exit}' scans/tcp-services.txt 2>/dev/null)"
+    service_name="$(printf '%s\n' "$service_line" | awk '{print tolower($3)}')"
+    if [[ "$service_name" =~ ^(winrm|wsman|ssl/winrm|ssl/wsman)$ ]] || \
+       { [[ "$port" =~ ^(5985|5986)$ ]] && printf '%s\n' "$service_line" | grep -Eiq 'microsoft[ -]httpapi'; }; then
+        return 1
+    fi
+    if [[ "$service_name" =~ ^(http|https|ssl/http|http-alt|http-proxy)$ ]]; then
+        return 0
+    fi
+
+    case "$port" in
+        21|22|25|53|88|110|111|135|139|143|389|445|464|593|636|993|995|1433|1883|2179|3268|3269|3389|5985|5986|9389)
+            return 1
+            ;;
+    esac
+
+    if printf '%s\n' "$service_line" | grep -Eiq \
+        'mqtt|msrpc|ncacn_http|vmrdp|ldap|kerberos|kpasswd|microsoft-ds|netbios|mc-nmf|message framing|rpc over http'; then
+        return 1
+    fi
+    return 0
+}
+
 is_vhost_base_candidate() {
     local name="$1"
     local suffix
@@ -939,7 +994,11 @@ pick_first_file() {
 }
 
 truncate_lines() {
-    cut -c1-300
+    local max_lines="${1:-500}"
+    awk -v max_lines="$max_lines" '
+        NR <= max_lines { print substr($0, 1, 300) }
+        END { if (NR > max_lines) printf("[... truncated %d additional lines ...]\n", NR - max_lines) }
+    '
 }
 
 run_with_timeout() {
@@ -971,6 +1030,26 @@ run_with_timeout() {
     return "$status"
 }
 
+run_bounded_listener() {
+    local seconds="$1"
+    local status
+    shift
+
+    if timeout --signal=TERM --kill-after=10 "$seconds" "$@"; then
+        record_result completed 0 "${1##*/}"
+        return 0
+    else
+        status="$?"
+    fi
+    if [[ "$status" == 124 || "$status" == 137 ]]; then
+        record_result completed 0 "${1##*/} bounded collection window ended"
+        return 0
+    fi
+    record_result error "$status" "${1##*/}"
+    echo "[!] Bounded listener exited with status $status: $1" >&2
+    return "$status"
+}
+
 run_fetch_curl() {
     local status
     if curl --noproxy '*' "$@"; then
@@ -989,9 +1068,11 @@ refresh_scanner_data() {
         return 0
     fi
 
-    if have nuclei; then
+    if [[ "$NUCLEI_ENABLE" == "1" || "$WEB_ASSESS" == "1" ]] && have nuclei; then
         echo "[+] Updating Nuclei templates before scanning."
         run_with_timeout "$SCANNER_UPDATE_MAXTIME" nuclei -update-templates || true
+    elif have nuclei; then
+        echo "[i] Skipping Nuclei template refresh because Nuclei is disabled in standard mode."
     fi
 
     if have nmap; then
@@ -1011,6 +1092,112 @@ append_unique_line() {
     [ -n "$value" ] || return 0
     touch "$file"
     grep -Fxq "$value" "$file" 2>/dev/null || echo "$value" >> "$file"
+}
+
+detect_target_profile() {
+    local clock_skew short_dc
+
+    mkdir -p enum/windows enum/ad
+    : > enum/ad/hosts-additions.txt
+
+    if grep -Eiq 'Microsoft Windows|OS: Windows|Microsoft-IIS|msrpc|microsoft-ds' \
+        scans/tcp-services.txt scans/tcp-aggressive.txt 2>/dev/null; then
+        TARGET_IS_WINDOWS=1
+    fi
+
+    if ports_lines | grep -q '^88$' && \
+       ports_lines | grep -Eq '^(389|636|3268|3269)$' && \
+       ports_lines | grep -q '^445$'; then
+        TARGET_IS_WINDOWS=1
+        TARGET_IS_AD=1
+    fi
+
+    AD_DOMAIN="$({ sed -nE 's/.*Domain: ([A-Za-z0-9._-]+).*/\1/p' \
+        scans/tcp-services.txt 2>/dev/null || true; } | head -1 || true)"
+    AD_DOMAIN="${AD_DOMAIN,,}"
+    if [ "$TARGET_IS_AD" = "1" ] && [ -z "$AD_DOMAIN" ]; then
+        AD_DOMAIN="${HOST,,}"
+    fi
+
+    AD_DC_HOST="$({ grep -Eho 'DNS:[A-Za-z0-9._-]+' scans/tcp-services.txt scans/tcp-aggressive.txt 2>/dev/null || true; } \
+        | sed 's/^DNS://' | tr '[:upper:]' '[:lower:]' | head -1 || true)"
+    if [ "$TARGET_IS_AD" = "1" ] && [ -z "$AD_DC_HOST" ] && [ -n "$AD_DOMAIN" ]; then
+        short_dc="$({ sed -nE 's/.*Service Info: Host: ([A-Za-z0-9_-]+).*/\1/p' \
+            scans/tcp-services.txt 2>/dev/null || true; } | head -1 || true)"
+        [ -z "$short_dc" ] || AD_DC_HOST="${short_dc,,}.$AD_DOMAIN"
+    fi
+
+    if [ -z "$KERBEROS_REALM" ] && [ -n "$AD_DOMAIN" ]; then
+        KERBEROS_REALM="${AD_DOMAIN^^}"
+    fi
+
+    clock_skew="$({ sed -nE 's/.*clock-skew:[[:space:]]*//p' \
+        scans/tcp-services.txt scans/tcp-aggressive.txt 2>/dev/null || true; } \
+        | head -1 || true)"
+    {
+        if [ "$TARGET_IS_AD" = "1" ]; then
+            echo "profile=windows-ad-dc"
+        elif [ "$TARGET_IS_WINDOWS" = "1" ]; then
+            echo "profile=windows"
+        else
+            echo "profile=generic"
+        fi
+        echo "domain=$AD_DOMAIN"
+        echo "realm=$KERBEROS_REALM"
+        echo "dc_hostname=$AD_DC_HOST"
+        echo "clock_skew=$clock_skew"
+    } | tee scans/target-profile.txt > enum/windows/profile.txt
+
+    if [ "$TARGET_IS_AD" = "1" ]; then
+        echo "[+] Active Directory domain controller profile detected."
+        echo "[+] Domain: ${AD_DOMAIN:-unknown}"
+        echo "[+] Kerberos realm: ${KERBEROS_REALM:-unknown}"
+        echo "[+] DC hostname: ${AD_DC_HOST:-unknown}"
+        if is_hostname_candidate "$AD_DC_HOST"; then
+            echo "$IP $AD_DC_HOST" > enum/ad/hosts-additions.txt
+        fi
+        if [ -n "$clock_skew" ]; then
+            printf '%s\n' "$clock_skew" > enum/ad/clock-skew.txt
+            echo "[!] Kerberos clock-skew evidence: $clock_skew"
+            echo "[!] Review enum/ad/ntp-query.txt before changing local time."
+        fi
+        if have ntpdate; then
+            run_with_timeout 30 ntpdate -q "$IP" | tee enum/ad/ntp-query.txt || true
+        fi
+    fi
+}
+
+run_web_assessment() {
+    local status
+    local -a assessor_args=()
+
+    [ "$WEB_ASSESS_RAN" = "0" ] || return 0
+    WEB_ASSESS_RAN=1
+
+    if [[ "$WEB_ASSESS" == "1" && "$NUCLEI_ENABLE" == "1" ]] && \
+       { [[ -s enum/web/live-web-urls.txt ]] || [[ -s enum/web/discovered-host-web-urls.txt ]]; }; then
+        if [[ -f ./web-assess.sh && -f ./web-assess.py ]]; then
+            if [[ -n "$WEB_ASSESS_ARGS_FILE" ]]; then mapfile -t assessor_args < "$WEB_ASSESS_ARGS_FILE"; fi
+            if [[ -n "$WEB_SESSION_FILE" ]]; then assessor_args+=(--session-file "$WEB_SESSION_FILE"); fi
+            if [[ -n "$WEB_REQUESTS_FILE" ]]; then assessor_args+=(--requests-file "$WEB_REQUESTS_FILE"); fi
+            if run_with_timeout "$WEB_ASSESS_MAXTIME" bash ./web-assess.sh "${assessor_args[@]}"; then
+                echo "[+] Automated web assessment finished; review its coverage limits."
+            else
+                status=$?
+                if [[ "$status" == "1" ]]; then
+                    echo "[!] Web assessment produced findings; see enum/web/assessments/."
+                else
+                    echo "[!] Web assessment incomplete (exit $status); inspect its report/logs."
+                fi
+            fi
+        else
+            echo "[!] Web assessment helper missing; initialize using the full repository checkout."
+            record_result error 127 "Web assessment helper missing"
+        fi
+    else
+        echo "[i] Web assessment disabled or no web URLs discovered."
+        record_result skipped 0 "Web assessment disabled or no web URLs"
+    fi
 }
 
 add_wordlist() {
@@ -1451,7 +1638,7 @@ run_cms_specific_checks() {
 }
 
 extract_dns_hostnames() {
-    local domain domain_regex tmp raw_hosts
+    local domain domain_regex evidence_file tmp raw_hosts
 
     mkdir -p enum/dns
     tmp="$(mktemp)"
@@ -1470,7 +1657,13 @@ extract_dns_hostnames() {
         is_hostname_candidate "$domain" || continue
 
         domain_regex="$(printf '%s' "$domain" | sed 's/[][\.^$*+?{}|()]/\\&/g')"
-        grep -RhoE "([A-Za-z0-9_-]+\.)*$domain_regex" enum/dns enum/web 2>/dev/null >> "$raw_hosts" || true
+        for evidence_file in \
+            enum/dns/dig-a.txt enum/dns/dig-ns.txt enum/dns/dig-mx.txt \
+            enum/dns/dnsrecon.txt enum/dns/gobuster-dns.txt \
+            enum/web/headers-*.txt enum/web/index-*.html enum/web/js-interesting-*.txt; do
+            [ -f "$evidence_file" ] || continue
+            grep -hoE "([A-Za-z0-9_-]+\.)*$domain_regex" "$evidence_file" 2>/dev/null >> "$raw_hosts" || true
+        done
         echo "$domain" >> "$raw_hosts"
     done < enum/dns/vhost-base-domains.txt
 
@@ -1489,6 +1682,7 @@ extract_dns_hostnames() {
         | tr '[:upper:]' '[:lower:]' \
         | grep -E '^[a-z0-9._-]+\.[a-z0-9._-]+$' \
         | grep -Ev '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+        | grep -Eiv '^(fuzz|hostmaster)\.' \
         | sort -u > enum/dns/discovered-hostnames.txt || true
 
     cp enum/dns/discovered-hostnames.txt "$tmp"
@@ -1500,7 +1694,9 @@ extract_dns_hostnames() {
     cp "$tmp" enum/dns/discovered-subdomains.txt
 
     while read -r name; do
-        [ -n "$name" ] && echo "$IP $name"
+        [ -n "$name" ] || continue
+        is_web_hostname_candidate "$name" || continue
+        echo "$IP $name"
     done < enum/dns/discovered-hostnames.txt > enum/dns/hosts-additions.txt
 }
 
@@ -1526,6 +1722,10 @@ probe_discovered_hostnames() {
 
     while read -r name; do
         [ -z "$name" ] && continue
+        if ! is_web_hostname_candidate "$name"; then
+            echo "[i] Keeping DNS infrastructure name as evidence, not probing it as a web vhost: $name"
+            continue
+        fi
         for port in $ports_to_probe; do
             for scheme in http https; do
                 if [[ "$scheme:$port" == "http:80" || "$scheme:$port" == "https:443" ]]; then
@@ -1557,9 +1757,13 @@ if ! "$RECON_PYTHON" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 
     echo "[-] HTB_PYTHON must select Python 3.10 or newer." >&2
     exit 2
 fi
-for knob in NMAP_MAXTIME SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME CURL_MAXTIME ANALYZER_MAXTIME ARCHIVE_MAXTIME WEB_ASSESS_MAXTIME SCANNER_UPDATE_MAXTIME NIKTO_MAXTIME NUCLEI_MAXTIME FEROX_MAXTIME FFUF_MAXTIME MAX_JS_FILES MAX_WEB_URLS MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS FFUF_THREADS FFUF_RATE FEROX_THREADS VULN_TIMEOUT MAX_VULN_RESULTS; do
+for knob in NMAP_MAXTIME SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME CURL_MAXTIME ANALYZER_MAXTIME ARCHIVE_MAXTIME WEB_ASSESS_MAXTIME SCANNER_UPDATE_MAXTIME NIKTO_MAXTIME NUCLEI_MAXTIME MQTT_ENUM_MAXTIME FEROX_MAXTIME FFUF_MAXTIME MAX_JS_FILES MAX_WEB_URLS MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS FFUF_THREADS FFUF_RATE FEROX_THREADS VULN_TIMEOUT MAX_VULN_RESULTS; do
     if [[ ! "${!knob}" =~ ^[1-9][0-9]*$ ]]; then echo "[-] $knob must be a positive integer." >&2; exit 2; fi
 done
+if [[ -n "$KERBEROS_USERDB" && ! -f "$KERBEROS_USERDB" ]]; then
+    echo "[-] Kerberos user list does not exist: $KERBEROS_USERDB" >&2
+    exit 2
+fi
 for input in "$WEB_SESSION_FILE" "$WEB_REQUESTS_FILE" "$WEB_ASSESS_ARGS_FILE"; do
     if [[ -n "$input" && ! -f "$input" ]]; then echo "[-] Web assessment input file does not exist: $input" >&2; exit 2; fi
 done
@@ -1736,7 +1940,7 @@ SNMP_WORDLIST="$(pick_first_file \
     /usr/share/wordlists/seclists/Discovery/SNMP/snmp.txt \
     || true)"
 
-mkdir -p scans enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,rdp,mssql,ssh,other}
+mkdir -p scans enum/{web,dns,smb,ftp,nfs,snmp,ldap,kerberos,rpc,winrm,rdp,mssql,ssh,windows,ad,mqtt,other}
 : > scans/tcp-full.txt
 : > scans/tcp-services.txt
 : > scans/udp-top100.txt
@@ -1746,14 +1950,14 @@ append_unique_line "$HOST" enum/dns/vhost-base-domains.txt
 echo "[+] Starting recon for $BOX / $IP"
 echo "[+] Hostname: $HOST"
 echo "[+] Started at: $START_TIME"
-echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM WEB_ASSESS=$WEB_ASSESS WEB_ASSESS_MAXTIME=$WEB_ASSESS_MAXTIME FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE NIKTO_MAXTIME=$NIKTO_MAXTIME NUCLEI_MAXTIME=$NUCLEI_MAXTIME NMAP_MAXTIME=$NMAP_MAXTIME SERVICE_ENUM_MAXTIME=$SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME=$WEB_PROBE_MAXTIME CURL_MAXTIME=$CURL_MAXTIME ANALYZER_MAXTIME=$ANALYZER_MAXTIME ARCHIVE_MAXTIME=$ARCHIVE_MAXTIME UPDATE_SCANNER_DATA=$UPDATE_SCANNER_DATA SCANNER_UPDATE_MAXTIME=$SCANNER_UPDATE_MAXTIME MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS VHOST_SUFFIXES=$VHOST_SUFFIXES ONLINE_VULN_CHECK=$ONLINE_VULN_CHECK VULN_TIMEOUT=$VULN_TIMEOUT MAX_VULN_RESULTS=$MAX_VULN_RESULTS"
+echo "[+] Runtime knobs: RECON_DEEP=$RECON_DEEP WEB_ENUM=$WEB_ENUM WEB_ASSESS=$WEB_ASSESS WEB_ASSESS_MAXTIME=$WEB_ASSESS_MAXTIME FEROX_ENABLE=$FEROX_ENABLE FEROX_EXTENSIONS=$FEROX_EXTENSIONS FEROX_COLLECT=$FEROX_COLLECT FEROX_MAXTIME=$FEROX_MAXTIME FEROX_THREADS=$FEROX_THREADS FFUF_CONTENT=$FFUF_CONTENT FFUF_VHOST=$FFUF_VHOST FFUF_MAXTIME=$FFUF_MAXTIME FFUF_THREADS=$FFUF_THREADS FFUF_RATE=$FFUF_RATE NIKTO_ENABLE=$NIKTO_ENABLE NIKTO_MAXTIME=$NIKTO_MAXTIME NUCLEI_ENABLE=$NUCLEI_ENABLE NUCLEI_MAXTIME=$NUCLEI_MAXTIME VULN_SCAN=$VULN_SCAN MQTT_ALL_TOPICS=$MQTT_ALL_TOPICS MQTT_ENUM_MAXTIME=$MQTT_ENUM_MAXTIME NMAP_MAXTIME=$NMAP_MAXTIME SERVICE_ENUM_MAXTIME=$SERVICE_ENUM_MAXTIME WEB_PROBE_MAXTIME=$WEB_PROBE_MAXTIME CURL_MAXTIME=$CURL_MAXTIME ANALYZER_MAXTIME=$ANALYZER_MAXTIME ARCHIVE_MAXTIME=$ARCHIVE_MAXTIME UPDATE_SCANNER_DATA=$UPDATE_SCANNER_DATA SCANNER_UPDATE_MAXTIME=$SCANNER_UPDATE_MAXTIME MAX_WEB_URLS=$MAX_WEB_URLS MAX_WEB_WORDLISTS=$MAX_WEB_WORDLISTS MAX_FFUF_WORDLISTS=$MAX_FFUF_WORDLISTS VHOST_SUFFIXES=$VHOST_SUFFIXES ONLINE_VULN_CHECK=$ONLINE_VULN_CHECK VULN_TIMEOUT=$VULN_TIMEOUT MAX_VULN_RESULTS=$MAX_VULN_RESULTS"
 
 echo
 echo "=============================="
 echo "[+] 0. Tool availability check"
 echo "=============================="
 
-for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone ldapsearch jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
+for TOOL in nmap timeout whatweb feroxbuster ffuf nikto curl dig dnsrecon gobuster smbclient enum4linux-ng enum4linux smbmap showmount rpcinfo rpcclient impacket-rpcdump rpcdump.py mosquitto_sub snmpwalk onesixtyone ldapsearch ntpdate jq zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan wpscan joomscan rg; do
     if have "$TOOL"; then
         echo "[+] $TOOL found"
     else
@@ -1842,11 +2046,13 @@ run_with_timeout "$NMAP_MAXTIME" nmap \
 run_with_timeout "$NMAP_MAXTIME" nmap \
     -A -Pn -p "$PORTS" "$IP" -oN scans/tcp-aggressive.txt || true
 run_with_timeout "$NMAP_MAXTIME" nmap \
-    -sV --script default,safe -Pn -p "$PORTS" "$IP" \
+    -sV --script "safe and not broadcast" -Pn -p "$PORTS" "$IP" \
     -oN scans/tcp-default-safe-scripts.txt || true
 else
     record_result skipped 0 "No confirmed open TCP ports"
 fi
+
+detect_target_profile
 
 echo
 echo "=============================="
@@ -1869,23 +2075,11 @@ show_progress 4 "Web service discovery"
 : > enum/web/curl-web-probe.txt
 
 for PORT in $(ports_lines); do
-    # A management endpoint can answer HTTP without being a web application.
-    # Preserve real apps on 5985/5986 unless their service fingerprint is WinRM.
-    if awk -v p="$PORT/tcp" '
-        $1 == p && $2 == "open" {
-            service=tolower($3); row=tolower($0)
-            if (service ~ /^(ssl\/)?(winrm|wsman)$/ ||
-                (p ~ /^(5985|5986)\/tcp$/ && row ~ /microsoft[ -]httpapi/)) found=1
-        } END { exit !found }' scans/tcp-services.txt; then
-        record_result skipped 0 "WinRM management endpoint excluded from web application testing"
+    if ! is_web_candidate_port "$PORT"; then
+        echo "[i] Excluding non-web service port from HTTP probing: $PORT"
+        record_result skipped 0 "Non-web service excluded from HTTP probing"
         continue
     fi
-    case "$PORT" in
-        21|22|25|53|88|110|111|135|139|143|389|445|464|593|636|993|995|1433|3268|3269|3389)
-            # Detected services override conventional port-number guesses.
-            if ! awk -v p="$PORT/tcp" '$1 == p && $2 == "open" && $3 ~ /http/ { found=1 } END { exit !found }' scans/tcp-services.txt; then continue; fi
-            ;;
-    esac
 
     echo "http://$IP:$PORT" >> enum/web/web-candidates.txt
     echo "https://$IP:$PORT" >> enum/web/web-candidates.txt
@@ -2083,11 +2277,13 @@ if [ -s enum/web/live-web-urls.txt ]; then
             run_cms_specific_checks "$URL" "$SAFE_URL" "$TECH_PROFILE"
         fi
 
-        if [[ "$WEB_ENUM" == "1" ]] && have nikto; then
+        if [[ "$WEB_ENUM" == "1" && "$NIKTO_ENABLE" == "1" ]] && have nikto; then
             echo "[+] Running nikto"
             run_with_timeout "$NIKTO_MAXTIME" nikto \
                 -h "$URL" \
                 -output "enum/web/nikto-$SAFE_URL.txt" || true
+        elif [[ "$WEB_ENUM" == "1" && "$NIKTO_ENABLE" != "1" ]]; then
+            echo "[i] Skipping Nikto in standard mode. Set NIKTO_ENABLE=1 or RECON_DEEP=1 to enable it."
         fi
 
         if [ "$SCHEME" = "https" ] && have openssl; then
@@ -2126,17 +2322,27 @@ if ports_lines | grep -q '^53$' || grep -Eq '^53/udp[[:space:]]+open([[:space:]]
     fi
 
     if have dnsrecon; then
-        run_with_timeout "$SERVICE_ENUM_MAXTIME" dnsrecon -d "$HOST" -n "$IP" -a \
+        # Keep DNSRecon pinned to the supplied resolver. The all-types mode can
+        # follow advertised NS addresses and leave the explicitly scoped target.
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" dnsrecon -d "$HOST" -n "$IP" -t srv \
             | tee enum/dns/dnsrecon.txt || true
     fi
 
     if have gobuster; then
         if [ -n "$DNS_WORDLIST" ]; then
-            run_with_timeout 900 gobuster dns \
-                -d "$HOST" \
-                -r "$IP" \
-                -w "$DNS_WORDLIST" \
-                -o enum/dns/gobuster-dns.txt || true
+            if gobuster dns --help 2>&1 | grep -q -- '--domain'; then
+                run_with_timeout 900 gobuster dns \
+                    --domain "$HOST" \
+                    --resolver "$IP" \
+                    --wordlist "$DNS_WORDLIST" \
+                    --output enum/dns/gobuster-dns.txt || true
+            else
+                run_with_timeout 900 gobuster dns \
+                    -d "$HOST" \
+                    -r "$IP" \
+                    -w "$DNS_WORDLIST" \
+                    -o enum/dns/gobuster-dns.txt || true
+            fi
         else
             echo "[!] Skipping gobuster DNS: no DNS wordlist found."
         fi
@@ -2180,29 +2386,11 @@ echo "[+] 7. Web application assessment"
 echo "=============================="
 show_progress 7 "Web application assessment"
 
-if [[ "$WEB_ASSESS" == "1" ]] && { [[ -s enum/web/live-web-urls.txt ]] || [[ -s enum/web/discovered-host-web-urls.txt ]]; }; then
-    if [[ -f ./web-assess.sh && -f ./web-assess.py ]]; then
-        WEB_ASSESS_ARGS=()
-        if [[ -n "$WEB_ASSESS_ARGS_FILE" ]]; then mapfile -t WEB_ASSESS_ARGS < "$WEB_ASSESS_ARGS_FILE"; fi
-        if [[ -n "$WEB_SESSION_FILE" ]]; then WEB_ASSESS_ARGS+=(--session-file "$WEB_SESSION_FILE"); fi
-        if [[ -n "$WEB_REQUESTS_FILE" ]]; then WEB_ASSESS_ARGS+=(--requests-file "$WEB_REQUESTS_FILE"); fi
-        if run_with_timeout "$WEB_ASSESS_MAXTIME" bash ./web-assess.sh "${WEB_ASSESS_ARGS[@]}"; then
-            echo "[+] Automated web assessment finished; review its coverage limits."
-        else
-            WEB_ASSESS_STATUS=$?
-            if [[ "$WEB_ASSESS_STATUS" == "1" ]]; then
-                echo "[!] Web assessment produced findings; see enum/web/assessments/."
-            else
-                echo "[!] Web assessment incomplete (exit $WEB_ASSESS_STATUS); inspect its report/logs."
-            fi
-        fi
-    else
-        echo "[!] Web assessment helper missing; initialize using the full repository checkout."
-        record_result error 127 "Web assessment helper missing"
-    fi
+if [[ "$TARGET_IS_AD" == "1" && "$WEB_ASSESS" == "1" && "$NUCLEI_ENABLE" == "1" ]] && \
+   { [[ -s enum/web/live-web-urls.txt ]] || [[ -s enum/web/discovered-host-web-urls.txt ]]; }; then
+    echo "[i] Deferring broad web assessment until Windows/AD service enumeration is complete."
 else
-    echo "[i] Web assessment disabled or no web URLs discovered."
-    record_result skipped 0 "Web assessment disabled or no web URLs"
+    run_web_assessment
 fi
 
 echo
@@ -2213,6 +2401,18 @@ show_progress 8 "SMB enumeration"
 
 SMB_PORTS="$(service_ports '^(139|445)$' '^(microsoft-ds|netbios-ssn|smb)$')"
 if [[ -n "$SMB_PORTS" ]]; then
+    # Fast modern fingerprinting first. These clients use 445 implicitly, so
+    # do not run them against a NetBIOS-only or unusual-port SMB endpoint.
+    if ports_lines | grep -q '^445$'; then
+        if have netexec; then
+            run_with_timeout "$SERVICE_ENUM_MAXTIME" netexec smb "$IP" \
+                | tee enum/smb/netexec-smb.txt || true
+        elif have crackmapexec; then
+            run_with_timeout "$SERVICE_ENUM_MAXTIME" crackmapexec smb "$IP" \
+                | tee enum/smb/cme-smb.txt || true
+        fi
+    fi
+
     for SMB_PORT in ${SMB_PORTS//,/ }; do
         if have smbclient; then
             run_with_timeout "$SERVICE_ENUM_MAXTIME" smbclient -L "\\\\$IP" -N -p "$SMB_PORT" \
@@ -2233,9 +2433,12 @@ if [[ -n "$SMB_PORTS" ]]; then
     if ports_lines | grep -Eq '^(139|445)$'; then
         if have enum4linux-ng; then
             run_with_timeout "$SERVICE_ENUM_MAXTIME" enum4linux-ng "$IP" -oA enum/smb/enum4linux-ng || true
-        elif have enum4linux; then
+        elif [[ "$RECON_DEEP" == "1" ]] && have enum4linux; then
             run_with_timeout "$SERVICE_ENUM_MAXTIME" enum4linux -a "$IP" \
                 | tee enum/smb/enum4linux.txt || true
+        elif have enum4linux; then
+            echo "[i] Skipping legacy enum4linux in standard mode. Enable with RECON_DEEP=1."
+            record_result skipped 0 "Legacy enum4linux disabled in standard mode"
         fi
     else
         record_result skipped 0 "enum4linux skipped on nonstandard SMB ports; explicit-port evidence collected"
@@ -2248,22 +2451,37 @@ if [[ -n "$SMB_PORTS" ]]; then
             run_with_timeout "$SERVICE_ENUM_MAXTIME" smbmap -H "$IP" \
                 | tee enum/smb/smbmap-null.txt || true
         fi
-
-        if have netexec; then
-            run_with_timeout "$SERVICE_ENUM_MAXTIME" netexec smb "$IP" \
-                | tee enum/smb/netexec-smb.txt || true
-        fi
-
-        if have crackmapexec; then
-            run_with_timeout "$SERVICE_ENUM_MAXTIME" crackmapexec smb "$IP" \
-                | tee enum/smb/cme-smb.txt || true
-        fi
     else
         record_result skipped 0 "Port 445 SMB clients skipped: 445 not discovered; explicit-port SMB evidence collected"
     fi
 else
     echo "[-] SMB ports not detected."
     record_result skipped 0 "SMB ports not detected"
+fi
+
+echo
+echo "=============================="
+echo "[+] 8.5 MQTT enumeration"
+echo "=============================="
+
+if ports_lines | grep -q '^1883$'; then
+    if have mosquitto_sub; then
+        echo "[+] Collecting bounded, read-only MQTT system topics."
+        run_bounded_listener "$MQTT_ENUM_MAXTIME" mosquitto_sub \
+            -h "$IP" -p 1883 -t '$SYS/#' -v \
+            | tee enum/mqtt/sys-topics.txt || true
+        if [ "$MQTT_ALL_TOPICS" = "1" ]; then
+            echo "[+] Deep mode: collecting bounded, read-only MQTT application topics."
+            run_bounded_listener "$MQTT_ENUM_MAXTIME" mosquitto_sub \
+                -h "$IP" -p 1883 -t '#' -v \
+                | tee enum/mqtt/all-topics.txt || true
+        fi
+    else
+        echo "[i] MQTT detected. Install mosquitto-clients for bounded topic collection."
+        echo "[i] Existing Nmap mqtt-subscribe evidence remains available in scans/."
+    fi
+else
+    echo "[-] MQTT port 1883 not detected."
 fi
 
 echo
@@ -2334,7 +2552,9 @@ echo "[+] 12. RPC enumeration"
 echo "=============================="
 show_progress 12 "RPC enumeration"
 
+RPC_ENUM_FOUND=0
 if ports_lines | grep -q '^111$'; then
+    RPC_ENUM_FOUND=1
     if have rpcinfo; then
         run_with_timeout "$SERVICE_ENUM_MAXTIME" rpcinfo -p "$IP" \
             | tee enum/rpc/rpcinfo.txt || true
@@ -2342,9 +2562,32 @@ if ports_lines | grep -q '^111$'; then
 
     run_with_timeout "$NMAP_MAXTIME" nmap \
         --script rpc-grind,rpcinfo -Pn -p111 "$IP" -oN enum/rpc/nmap-rpc.txt || true
-else
-    echo "[-] RPCBind port not detected."
-    record_result skipped 0 "RPCBind port not detected"
+fi
+
+if ports_lines | grep -Eq '^(135|593)$'; then
+    RPC_ENUM_FOUND=1
+    MSRPC_PORTS="$(ports_lines | grep -E '^(135|593)$' | paste -sd, -)"
+
+    if have rpcclient; then
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" rpcclient -U '' -N "$IP" -c srvinfo \
+            | tee enum/rpc/rpcclient-null-srvinfo.txt || true
+    fi
+
+    if have impacket-rpcdump; then
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" impacket-rpcdump -target-ip "$IP" "@$IP" \
+            | tee enum/rpc/impacket-rpcdump.txt || true
+    elif have rpcdump.py; then
+        run_with_timeout "$SERVICE_ENUM_MAXTIME" rpcdump.py -target-ip "$IP" "@$IP" \
+            | tee enum/rpc/impacket-rpcdump.txt || true
+    fi
+
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        --script msrpc-enum -Pn -p "$MSRPC_PORTS" "$IP" -oN enum/rpc/nmap-msrpc.txt || true
+fi
+
+if [ "$RPC_ENUM_FOUND" = "0" ]; then
+    echo "[-] RPCBind/MSRPC ports not detected."
+    record_result skipped 0 "RPCBind/MSRPC ports not detected"
 fi
 
 echo
@@ -2406,6 +2649,7 @@ if [[ -n "$LDAP_PORTS" ]]; then
             LDAPTLS_REQCERT=never run_with_timeout "$SERVICE_ENUM_MAXTIME" ldapsearch \
                 -x -H "$LDAP_URI" -o nettimeout=10 -l 20 -s base -b '' '(objectClass=*)' \
                 namingContexts defaultNamingContext rootDomainNamingContext dnsHostName supportedLDAPVersion \
+                domainFunctionality forestFunctionality \
                 | tee -a "enum/ldap/namingcontexts-$LDAP_PORT.txt" || true
         done
     else
@@ -2427,7 +2671,17 @@ if [[ -n "$KERBEROS_PORTS" ]]; then
     run_with_timeout "$NMAP_MAXTIME" nmap \
         -sV -Pn -p "$KERBEROS_PORTS" "$IP" \
         -oN enum/kerberos/nmap-kerberos.txt -oX enum/kerberos/nmap-kerberos.xml || true
-    record_result skipped 0 "Kerberos username guessing requires a separate operator-directed check"
+    if [ -n "$KERBEROS_USERDB" ] && [ -f "$KERBEROS_USERDB" ] && [ -n "$KERBEROS_REALM" ]; then
+        echo "[+] Running explicitly enabled Kerberos username enumeration."
+        run_with_timeout "$NMAP_MAXTIME" nmap \
+            --script krb5-enum-users \
+            --script-args "krb5-enum-users.realm=$KERBEROS_REALM,userdb=$KERBEROS_USERDB" \
+            -Pn -p "$KERBEROS_PORTS" "$IP" -oN enum/kerberos/nmap-kerberos-users.txt || true
+    else
+        echo "[i] Kerberos detected; intrusive username enumeration is disabled by default."
+        echo "[i] To enable it, set KERBEROS_REALM and KERBEROS_USERDB=/path/to/users.txt."
+        record_result skipped 0 "Kerberos username guessing requires explicit realm and user list"
+    fi
 else
     echo "[-] Kerberos port not detected."
     record_result skipped 0 "Kerberos port not detected"
@@ -2453,9 +2707,7 @@ if [[ -n "$WINRM_PORTS" ]]; then
         if have netexec; then
             run_with_timeout "$SERVICE_ENUM_MAXTIME" netexec winrm "$IP" \
                 | tee enum/winrm/netexec-winrm.txt || true
-        fi
-
-        if have crackmapexec; then
+        elif have crackmapexec; then
             run_with_timeout "$SERVICE_ENUM_MAXTIME" crackmapexec winrm "$IP" \
                 | tee enum/winrm/cme-winrm.txt || true
         fi
@@ -2465,6 +2717,12 @@ if [[ -n "$WINRM_PORTS" ]]; then
 else
     echo "[-] WinRM ports not detected."
     record_result skipped 0 "WinRM ports not detected"
+fi
+
+if [[ "$TARGET_IS_AD" == "1" && "$WEB_ASSESS_RAN" == "0" ]]; then
+    echo
+    echo "[+] Deferred web application assessment"
+    run_web_assessment
 fi
 
 echo
@@ -2509,7 +2767,7 @@ show_progress 19 "Generate port summary"
     echo
     echo "| Port | Service | Version | Notes |"
     echo "|---:|---|---|---|"
-    awk '/^[0-9]+\/tcp[[:space:]]+open/ {
+    awk '$1 ~ /^[0-9]+\/tcp$/ && $2 == "open" {
         port=$1
         sub("/tcp", "", port)
         service=$3
@@ -2526,15 +2784,20 @@ echo "[+] 20. Optional vulnerability Nmap scan"
 echo "========================================="
 show_progress 20 "Nmap vulnerability scan"
 
-echo "[+] This scan can be slow/noisy. Treat results as hints."
-echo "[+] Service detection is enabled so version-dependent scripts such as Vulners can run."
-# NSE does not reuse version/CPE information from the earlier invocation.
-if [[ -n "$PORTS" ]]; then
-run_with_timeout "$NMAP_MAXTIME" nmap \
-    -sV --script vuln -Pn -p "$PORTS" "$IP" \
-    -oN scans/tcp-vuln.txt -oX scans/tcp-vuln.xml || true
-else
+if [[ "$VULN_SCAN" == "1" && -n "$PORTS" ]]; then
+    echo "[+] This scan can be slow/noisy. Treat results as hints."
+    echo "[+] Service detection is enabled so version-dependent scripts such as Vulners can run."
+    # NSE does not reuse version/CPE information from the earlier invocation.
+    run_with_timeout "$NMAP_MAXTIME" nmap \
+        -sV --script "vuln and not broadcast" -Pn -p "$PORTS" "$IP" \
+        -oN scans/tcp-vuln.txt -oX scans/tcp-vuln.xml || true
+elif [[ "$VULN_SCAN" == "1" ]]; then
     record_result skipped 0 "No confirmed open TCP ports"
+    : > scans/tcp-vuln.txt
+else
+    echo "[i] Skipping broad vulnerability NSE in standard mode. Set VULN_SCAN=1 or RECON_DEEP=1 to enable it."
+    record_result skipped 0 "Broad vulnerability NSE disabled in standard mode"
+    : > scans/tcp-vuln.txt
 fi
 
 echo
@@ -2547,6 +2810,10 @@ grep -RniIE \
     --exclude="interesting-grep.txt" \
     --exclude="summary.md" \
     --exclude="recon-console.log" \
+    --exclude="http.templates.txt" \
+    --exclude="targets.txt" \
+    --exclude="priority-vhosts.txt" \
+    --exclude-dir="assessments" \
     --exclude="*.zip" \
     --exclude="*.map" \
     --exclude="ffuf-vhosts-*.json" \
@@ -2565,6 +2832,8 @@ echo "[+] 22. Generate recon summary"
 echo "=============================="
 show_progress 22 "Generate recon summary"
 
+LATEST_WEB_REPORT="$(find enum/web/assessments -mindepth 2 -maxdepth 2 -name report.json -type f 2>/dev/null | sort | tail -1 || true)"
+
 {
     echo "# Recon Summary - $BOX"
     echo
@@ -2575,6 +2844,10 @@ show_progress 22 "Generate recon summary"
     echo "- Started: $START_TIME"
     echo "- Finished: $(date)"
     echo
+    echo "## Target Profile"
+    echo
+    cat scans/target-profile.txt 2>/dev/null || true
+    echo
     echo "## Open TCP Ports"
     echo
     if [[ -z "$PORTS" ]]; then echo "No open TCP ports were discovered; see run-status.json for discovery completeness."; fi
@@ -2583,6 +2856,28 @@ show_progress 22 "Generate recon summary"
     echo "## Service Scan"
     echo
     grep -E '^[0-9]+/tcp\s+open' scans/tcp-services.txt 2>/dev/null || true
+    echo
+    echo "## Open UDP Ports"
+    echo
+    grep -E '^[0-9]+/udp\s+open[[:space:]]' scans/udp-top100.txt 2>/dev/null || true
+    echo
+    echo "## Windows / AD Evidence"
+    echo
+    cat enum/smb/netexec-smb.txt enum/smb/cme-smb.txt enum/ad/clock-skew.txt enum/ad/ntp-query.txt 2>/dev/null || true
+    grep -E 'Message signing enabled and required|Domain (Name|Sid):|Null Auth:' \
+        enum/smb/*.txt 2>/dev/null | truncate_lines 80 || true
+    echo
+    echo "## LDAP Naming Contexts"
+    echo
+    grep -Ei '^(dnsHostName|rootDomainNamingContext|defaultNamingContext|namingContexts|domainFunctionality|forestFunctionality):' \
+        enum/ldap/namingcontexts-*.txt enum/ldap/rootdse.txt 2>/dev/null || true
+    echo
+    echo "## MQTT Evidence"
+    echo
+    grep -hE 'mqtt-subscribe:|\$SYS/|mqttui-' \
+        scans/tcp-services.txt scans/tcp-aggressive.txt scans/tcp-default-safe-scripts.txt 2>/dev/null \
+        | truncate_lines 100 || true
+    cat enum/mqtt/sys-topics.txt enum/mqtt/all-topics.txt 2>/dev/null | truncate_lines 100 || true
     echo
     echo "## Live Web URLs"
     echo
@@ -2603,6 +2898,20 @@ show_progress 22 "Generate recon summary"
     echo "## HTTPX Web Services"
     echo
     cat enum/web/httpx-web-services.txt 2>/dev/null || true
+    echo
+    echo "## Web Assessment Status"
+    echo
+    if [ -n "$LATEST_WEB_REPORT" ]; then
+        echo "- Report: $LATEST_WEB_REPORT"
+        if have jq; then
+            jq -r '"- Status: \(.status // \"unknown\")\n- Findings: \((.findings // []) | length)\n- Diagnostics: \((.diagnostics // []) | join(\"; \"))"' \
+                "$LATEST_WEB_REPORT" 2>/dev/null || true
+        else
+            sed -n '1,80p' "$LATEST_WEB_REPORT"
+        fi
+    else
+        echo "- Not run (broad Nuclei assessment is deep/opt-in)."
+    fi
     echo
     echo "## Curl Web Probe"
     echo
@@ -2633,6 +2942,9 @@ show_progress 22 "Generate recon summary"
     echo "## Interesting Web Headers"
     echo
     grep -RniIE \
+        --exclude-dir="assessments" \
+        --exclude="http.templates.txt" \
+        --exclude="targets.txt" \
         --exclude="*.map" \
         --exclude="*tailwind*" \
         --exclude="*polyfills*" \
@@ -2860,13 +3172,17 @@ the full local review workflow. These commands analyze existing evidence.
 cd $BASE_DIR
 ./update-hosts.sh
 ./recon.sh
+less overview.md
 less summary.md
+less recon-analysis.md
 \`\`\`
 
 ## Main Files
 
 * .target.env - machine-local config
 * summary.md - generated recon summary
+* overview.md and overview.json - short ranked attack paths and coverage gaps
+* recon-analysis.md - evidence-driven prioritized next steps
 * notes.md - working notes
 * writeup.md - final report/writeup
 * recon.sh - automated first-stage recon
@@ -2878,6 +3194,8 @@ less summary.md
 * zip-recon.sh - archive recon results
 * privesc-linux.md - local Linux privilege escalation checklist
 * recon-console.log - full terminal output from recon
+* run-status.json and run-stages.tsv - current collection status and command outcomes
+* runs/ - recoverable generated evidence from previous runs
 * scans/ - Nmap outputs
 * enum/ - service-specific enumeration outputs
 
@@ -2888,8 +3206,9 @@ Kerberos, WinRM, RDP, and MSSQL checks save text and XML beneath their matching
 \`enum/\` directories. Detected services on unusual TCP ports are included.
 LDAP account-name searches are anonymous and limited to 20 objects; rootDSE
 metadata alone does not prove anonymous directory access. Kerberos username
-guessing is skipped. WinRM management fingerprints are kept out of automatic
-web application testing. Every command retains the configured timeout.
+guessing is skipped unless both KERBEROS_REALM and KERBEROS_USERDB are supplied.
+WinRM management fingerprints are kept out of automatic web application
+testing. Every command retains the configured timeout.
 
 ## Useful Review Commands
 
@@ -2910,7 +3229,12 @@ less summary.md
 
 ## Runtime Safety Knobs
 
-Default recon is conservative to avoid ffuf/ferox loops on dynamic targets.
+Default recon is conservative and keeps broad Nuclei, Nikto, legacy enum4linux,
+and the Nmap vulnerability category disabled. Deep mode restores those checks.
+Every new run archives previous generated evidence in runs/.
+Windows/AD detection is automatic and additive: it records the target profile,
+LDAP rootDSE, RPC, SMB, and clock-skew evidence without changing local time.
+Kerberos username enumeration runs only when a realm and user list are supplied.
 
 \`\`\`bash
 # Fast default recon
@@ -2932,14 +3256,17 @@ FFUF_RATE=40 FFUF_THREADS=10 FFUF_MAXTIME=180 ./recon.sh
 FFUF_VHOST=0 ./recon.sh
 VHOST_SUFFIXES=htb,vl,local,test ./recon.sh
 NIKTO_MAXTIME=300 NUCLEI_MAXTIME=300 ./recon.sh
+NIKTO_ENABLE=1 NUCLEI_ENABLE=1 VULN_SCAN=1 ./recon.sh
+MQTT_ALL_TOPICS=1 MQTT_ENUM_MAXTIME=30 ./recon.sh
+KERBEROS_REALM=EXAMPLE.HTB KERBEROS_USERDB=/path/to/users.txt ./recon.sh
 NMAP_MAXTIME=600 SERVICE_ENUM_MAXTIME=180 ./recon.sh
 UPDATE_SCANNER_DATA=0 ./recon.sh
 
-# Scope-aware web assessment runs automatically after web/vhost discovery
-WEB_ASSESS_MAXTIME=2100 ./recon.sh
+# Broad scope-aware Nuclei assessment is deep/opt-in
+WEB_ASSESS=1 WEB_ASSESS_MAXTIME=2100 ./recon.sh
 WEB_ASSESS=0 ./recon.sh
 
-# Online OSV/NVD enrichment runs by default after collection
+# Online OSV/NVD enrichment runs by default; the offline report is always made
 ONLINE_VULN_CHECK=0 ./recon.sh
 VULN_TIMEOUT=30 MAX_VULN_RESULTS=5 ./recon.sh
 VULN_ANALYZER=/path/to/analyze-recon.py ./recon.sh

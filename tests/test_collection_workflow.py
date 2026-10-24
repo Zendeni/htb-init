@@ -42,13 +42,26 @@ nmap() {
         if [[ "$normal" != *udp* ]]; then
             if [ "$ports" != none ]; then
                 for port in ${ports//,/ }; do
-                    local service="${MOCK_SERVICE:-http}"
-                    if [[ "$port" == 22 && -z "${MOCK_SERVICE:-}" ]]; then service=ssh; fi
+                    local service="${MOCK_SERVICE:-}" version="${MOCK_PRODUCT:-}"
+                    if [[ -z "$service" ]]; then
+                        case "$port" in
+                            22) service=ssh; version="${version:-SSH fixture}" ;;
+                            53) service=domain; version="${version:-DNS fixture}" ;;
+                            88) service=kerberos-sec; version="${version:-Kerberos fixture}" ;;
+                            135) service=msrpc; version="${version:-RPC fixture}" ;;
+                            139) service=netbios-ssn; version="${version:-NetBIOS fixture}" ;;
+                            389) service=ldap; version="${version:-LDAP fixture}" ;;
+                            445) service=microsoft-ds; version="${version:-SMB fixture}" ;;
+                            1883) service=mqtt; version="${version:-MQTT fixture}" ;;
+                            5985) service=http; version="${version:-Microsoft HTTPAPI httpd}" ;;
+                            *) service=http; version="${version:-Fixture server 1.2}" ;;
+                        esac
+                    fi
                     local mapping
                     for mapping in ${MOCK_SERVICE_MAP//,/ }; do
                         if [[ "$mapping" == "$port="* ]]; then service="${mapping#*=}"; fi
                     done
-                    printf '%s/tcp open %s %s\n' "$port" "$service" "${MOCK_PRODUCT:-Fixture server 1.2}" >> "$normal"
+                    printf '%s/tcp open %s %s\n' "$port" "$service" "$version" >> "$normal"
                 done
             fi
             # This state must not be mistaken for confirmed open TCP ports.
@@ -100,13 +113,23 @@ timeout() {
     fi
     "$@"
 }
-for tool in whatweb feroxbuster nikto dig dnsrecon gobuster smbclient \
-    enum4linux-ng enum4linux smbmap showmount rpcinfo snmpwalk onesixtyone \
-    ldapsearch zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan \
+for tool in whatweb feroxbuster nikto dig smbclient \
+    enum4linux-ng enum4linux smbmap showmount rpcinfo rpcclient impacket-rpcdump \
+    rpcdump.py mosquitto_sub snmpwalk onesixtyone ldapsearch ntpdate zip nc openssl ftp httpx nuclei netexec crackmapexec droopescan \
     wpscan joomscan sudo; do
     eval "$tool() { mock_log $tool \"\$@\"; return 0; }"
 done
 zip() { mock_log zip "$@"; mock_log zip-umask "$(umask)"; if [[ "${MOCK_ZIP_EXIT:-0}" != 0 ]]; then return "$MOCK_ZIP_EXIT"; fi; : > "$2"; }
+dnsrecon() {
+    mock_log dnsrecon "$@"
+    printf '%b' "${MOCK_DNSRECON_OUTPUT:-}"
+}
+gobuster() {
+    mock_log gobuster "$@"
+    if [[ "$*" == "dns --help" ]]; then
+        printf '%s\n' '  --domain value' '  --resolver value'
+    fi
+}
 '''
 
 
@@ -223,7 +246,7 @@ exit "${MOCK_ASSESS_STATUS:-0}"
             self.assertIn(cms, detected)
         for tool in ("ffuf", "feroxbuster", "nikto", "droopescan", "wpscan", "joomscan"):
             self.assertFalse(self.commands(tool), f"{tool} must honor WEB_ENUM=0")
-        self.assertEqual(self.commands("nuclei"), [["-update-templates"]])
+        self.assertFalse(self.commands("nuclei"))
         self.assertTrue((self.workspace / "enum/web/live-web-urls.txt").read_text())
 
     def test_enabled_assessor_is_skipped_without_live_web_targets(self):
@@ -234,9 +257,10 @@ exit "${MOCK_ASSESS_STATUS:-0}"
         self.assertFalse(self.commands("web-assess"))
 
     def test_vulnerability_and_safe_scans_detect_versions_in_the_same_invocation(self):
+        self.env["VULN_SCAN"] = "1"
         self.recon()
         scans = self.commands("nmap")
-        for scripts in ("vuln", "default,safe"):
+        for scripts in ("vuln and not broadcast", "safe and not broadcast"):
             scan = next(args for args in scans if "--script" in args and
                         args[args.index("--script") + 1] == scripts)
             self.assertIn("-sV", scan)
@@ -244,6 +268,84 @@ exit "${MOCK_ASSESS_STATUS:-0}"
         for stem in ("tcp-services", "tcp-vuln"):
             self.assertTrue((self.workspace / "scans" / (stem + ".xml")).exists())
         self.assertEqual((self.workspace / "scans/open-tcp-ports.txt").read_text().strip(), "80")
+
+    def test_standard_mode_skips_broad_nuclei_nikto_vuln_and_legacy_enum(self):
+        self.env["MOCK_PORTS"] = "80,445"
+        result = self.recon()
+        self.assertIn("Skipping Nikto in standard mode", result.stdout)
+        self.assertIn("Skipping broad vulnerability NSE in standard mode", result.stdout)
+        self.assertFalse(self.commands("nuclei"))
+        self.assertFalse(self.commands("nikto"))
+        self.assertFalse(self.commands("enum4linux"))
+        self.assertTrue(self.commands("enum4linux-ng"))
+
+    def test_new_run_archives_previous_generated_evidence(self):
+        stale = self.workspace / "enum" / "web" / "old-5985.txt"
+        stale.write_text("stale\n", encoding="utf-8")
+        (self.workspace / "summary.md").write_text("old summary\n", encoding="utf-8")
+        self.recon()
+        self.assertFalse(stale.exists())
+        archived = list((self.workspace / "runs").glob("*/enum/web/old-5985.txt"))
+        self.assertEqual(len(archived), 1)
+        status = json.loads((self.workspace / "run-status.json").read_text())
+        self.assertEqual(status["status"], "completed")
+
+    def test_dns_tools_stay_pinned_and_hostname_extraction_rejects_placeholders(self):
+        self.env.update(
+            MOCK_PORTS="53,80",
+            MOCK_DNSRECON_OUTPUT=(
+                "dc01.fixture.htb 192.0.2.10\n"
+                "FUZZ.fixture.htb 192.0.2.10\n"
+                "hostmaster.fixture.htb 192.0.2.10\n"
+                "domaindnszones.fixture.htb 192.0.2.10\n"
+                "gc._msdcs.fixture.htb 192.0.2.10\n"
+            ),
+        )
+        self.recon()
+        dnsrecon = self.commands("dnsrecon")[-1]
+        self.assertEqual(dnsrecon[dnsrecon.index("-n") + 1], "192.0.2.10")
+        self.assertEqual(dnsrecon[dnsrecon.index("-t") + 1], "srv")
+        self.assertNotIn("-a", dnsrecon)
+        gobuster = next(args for args in self.commands("gobuster") if "--domain" in args)
+        self.assertEqual(gobuster[gobuster.index("--domain") + 1], "fixture.htb")
+        self.assertEqual(gobuster[gobuster.index("--resolver") + 1], "192.0.2.10")
+        names = (self.workspace / "enum/dns/discovered-hostnames.txt").read_text()
+        self.assertIn("dc01.fixture.htb", names)
+        self.assertNotIn("fuzz.fixture.htb", names)
+        self.assertNotIn("hostmaster.fixture.htb", names)
+        additions = (self.workspace / "enum/dns/hosts-additions.txt").read_text()
+        self.assertNotIn("domaindnszones.fixture.htb", additions)
+        self.assertNotIn("gc._msdcs.fixture.htb", additions)
+        web_probes = (self.workspace / "enum/web/discovered-host-web-probe.txt").read_text()
+        self.assertNotIn("domaindnszones.fixture.htb", web_probes)
+        self.assertNotIn("gc._msdcs.fixture.htb", web_probes)
+
+    def test_mqtt_is_not_probed_as_http_and_collection_is_read_only(self):
+        self.env.update(MOCK_PORTS="1883", MQTT_ALL_TOPICS="1")
+        self.recon()
+        self.assertFalse(self.commands("curl"))
+        subscriptions = self.commands("mosquitto_sub")
+        self.assertEqual(len(subscriptions), 2)
+        topics = {args[args.index("-t") + 1] for args in subscriptions}
+        self.assertEqual(topics, {"$SYS/#", "#"})
+        self.assertTrue(all("mosquitto_pub" not in args for args in subscriptions))
+
+    def test_ad_profile_defers_web_assessment_and_adds_safe_windows_facts(self):
+        self.mock_assessor()
+        self.env.update(WEB_ASSESS="1", MOCK_PORTS="53,80,88,135,389,445,5985")
+        result = self.recon()
+        self.assertIn("profile=windows-ad-dc", (self.workspace / "scans/target-profile.txt").read_text())
+        self.assertIn("realm=FIXTURE.HTB", (self.workspace / "scans/target-profile.txt").read_text())
+        self.assertEqual(len(self.commands("web-assess")), 1)
+        self.assertLess(result.stdout.index("16. WinRM enumeration"),
+                        result.stdout.index("Deferred web application assessment"))
+        self.assertTrue(self.commands("rpcclient"))
+        self.assertTrue(self.commands("impacket-rpcdump"))
+        rootdse = self.commands("ldapsearch")[-1]
+        self.assertIn("-b", rootdse)
+        self.assertIn("defaultNamingContext", rootdse)
+        self.assertIn("Kerberos detected; intrusive username enumeration is disabled", result.stdout)
+        self.assertFalse(any("krb5-enum-users" in args for args in self.commands("nmap")))
 
     def test_http_404_is_live_and_evidence_patterns_match_alternatives(self):
         self.recon()
